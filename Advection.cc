@@ -11,7 +11,6 @@
 #include <deal.II/lac/vector.h>
 #include <deal.II/lac/solver_cg.h>
 #include <deal.II/lac/precondition.h>
-#include <deal.II/lac/solver_gmres.h>
 #include <deal.II/lac/affine_constraints.h>
 
 #include <deal.II/grid/tria.h>
@@ -25,7 +24,7 @@
 #include <deal.II/dofs/dof_accessor.h>
 #include <deal.II/dofs/dof_tools.h>
 
-#include <deal.II/fe/fe_dgq.h>
+#include <deal.II/fe/fe_q.h>
 #include <deal.II/fe/fe_values.h>
 #include <deal.II/fe/fe_tools.h>
 #include <deal.II/fe/fe_system.h>
@@ -151,8 +150,8 @@ AdvectionSolver<dim>::AdvectionSolver(RunTimeParameters::Data_Storage& data):
   dt(data.dt),
   triangulation(MPI_COMM_WORLD, parallel::distributed::Triangulation<dim>::limit_level_difference_at_vertices,
                 parallel::distributed::Triangulation<dim>::construct_multigrid_hierarchy),
-  fe_density(FE_DGQ<dim>(EquationData::degree), 1),
-  fe_velocity(FE_DGQ<dim>(EquationData::degree), dim),
+  fe_density(FE_Q<dim>(EquationData::degree), 1),
+  fe_velocity(FE_Q<dim>(EquationData::degree), dim),
   dof_handler_density(triangulation),
   dof_handler_velocity(triangulation),
   quadrature_density(EquationData::degree + 1),
@@ -197,7 +196,7 @@ void AdvectionSolver<dim>::create_triangulation(const unsigned int n_refines) {
 
   GridGenerator::subdivided_hyper_cube(triangulation, 15, -0.5, 0.5, true);
 
-  std::vector<GridTools::PeriodicFacePair<typename Triangulation<dim>::cell_iterator>> periodic_faces;
+  std::vector<GridTools::PeriodicFacePair<typename parallel::distributed::Triangulation<dim>::cell_iterator>> periodic_faces;
   GridTools::collect_periodic_faces(triangulation, 0, 1, 0, periodic_faces);
   GridTools::collect_periodic_faces(triangulation, 2, 3, 1, periodic_faces);
   triangulation.add_periodicity(periodic_faces);
@@ -246,6 +245,9 @@ void AdvectionSolver<dim>::setup_dofs() {
   /*--- Set the container with the constraints. Each entry is empty (no Dirichlet and weak imposition in general)
         and this is necessary only for compatibilty reasons ---*/
   constraints.push_back(&constraints_velocity);
+  DoFTools::make_periodicity_constraints(dof_handler_density, 0, 1, 0, constraints_density);
+  DoFTools::make_periodicity_constraints(dof_handler_density, 2, 3, 1, constraints_density);
+  constraints_density.close();
   constraints.push_back(&constraints_density);
 
   /*--- Set the quadrature formula to compute the integrals for assembling bilinear and linear forms ---*/
@@ -294,7 +296,7 @@ void AdvectionSolver<dim>::update_density() {
   if(HYPERBOLIC_stage == 1) {
     advection_matrix.vmult_rhs_update(rhs_rho, {rho_old});
   }
-  else if(HYPERBOLIC_stage == 2){
+  else if(HYPERBOLIC_stage == 2) {
     advection_matrix.vmult_rhs_update(rhs_rho, {rho_tmp_2});
   }
   else {

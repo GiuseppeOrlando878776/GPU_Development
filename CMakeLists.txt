@@ -1,9 +1,10 @@
 ##
-#  CMake script for the step-35 tutorial program:
+#  CMake script
 ##
 
 # Set the name of the project and target:
 SET(TARGET "Advection")
+#SET(TARGET "step-64")
 
 # Declare all source files the target consists of. Here, this is only
 # the one step-X.cc file, but as you expand your project you may wish
@@ -18,10 +19,13 @@ SET(TARGET "Advection")
 SET(TARGET_SRC
   ${TARGET}.cc
   )
+#SET(TARGET_SRC
+#  ${TARGET}.cu
+#  )
 
 # Usually, you will not need to modify anything beyond this point...
 
-CMAKE_MINIMUM_REQUIRED(VERSION 2.8.12)
+CMAKE_MINIMUM_REQUIRED(VERSION 3.10)
 
 FIND_PACKAGE(deal.II 9.3.0
   HINTS ${deal.II_DIR} ${DEAL_II_DIR} ../ ../../ $ENV{DEAL_II_DIR}
@@ -37,14 +41,16 @@ ENDIF()
 #
 # Are all dependencies fulfilled?
 #
-IF(NOT DEAL_II_WITH_MPI OR NOT DEAL_II_WITH_P4EST) # keep in one line
+IF(NOT DEAL_II_WITH_MPI OR NOT DEAL_II_WITH_P4EST OR NOT DEAL_II_WITH_CUDA) # keep in one line
   MESSAGE(FATAL_ERROR "
 Error! This tutorial requires a deal.II library that was configured with the following options:
     DEAL_II_WITH_MPI = ON
     DEAL_II_WITH_P4EST = ON
+    DEAL_II_WITH_CUDA = ON
 However, the deal.II library found at ${DEAL_II_PATH} was configured with these options
     DEAL_II_WITH_MPI = ${DEAL_II_WITH_MPI}
     DEAL_II_WITH_P4EST = ${DEAL_II_WITH_P4EST}
+    DEAL_II_WITH_CUDA = ${DEAL_II_WITH_CUDA}
 which conflict with the requirements."
     )
 ENDIF()
