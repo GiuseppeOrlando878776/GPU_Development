@@ -391,21 +391,18 @@ void AdvectionSolver<dim>::run(const bool verbose, const unsigned int output_int
 
     /*--- First stage of the IMEX operator ---*/
     HYPERBOLIC_stage = 1;
-    advection_matrix.set_HYPERBOLIC_stage(HYPERBOLIC_stage);
 
     verbose_cout << "  Update stage 1" << std::endl;
     update_density();
 
     /*--- Second stage of IMEX operator ---*/
     HYPERBOLIC_stage = 2;
-    advection_matrix.set_HYPERBOLIC_stage(HYPERBOLIC_stage);
 
     verbose_cout << "  Update stage 2" << std::endl;
     update_density();
 
     /*--- Final stage of RK scheme to update ---*/
     HYPERBOLIC_stage = 3;
-    advection_matrix.set_HYPERBOLIC_stage(HYPERBOLIC_stage);
 
     verbose_cout << "  Update stage 3" << std::endl;
     update_density();

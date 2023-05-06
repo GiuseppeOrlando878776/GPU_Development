@@ -33,8 +33,6 @@ namespace Advection {
     void set_dt(const double time_step); /*--- Setter of the time-step. This is useful both for multigrid purposes and also
                                                in case of modifications of the time step. ---*/
 
-    void set_HYPERBOLIC_stage(const unsigned int stage); /*--- Setter of the IMEX stage. ---*/
-
     void vmult_rhs_update(Vec& dst, const std::vector<Vec>& src) const; /*--- Auxiliary function to assemble the rhs. ---*/
 
     virtual void compute_diagonal() override {} /*--- Overriden function to compute the diagonal. ---*/
@@ -45,8 +43,6 @@ namespace Advection {
     EquationData::Velocity<dim> u; /*--- Advecting field ---*/
 
     double       dt; /*--- Time step. ---*/
-
-    unsigned int HYPERBOLIC_stage; /*--- Flag for the time discretization scheme stage ---*/
 
     virtual void apply_add(Vec& dst, const Vec& src) const override; /*--- Overriden function which actually assembles the
                                                                            bilinear forms ---*/
@@ -72,7 +68,7 @@ namespace Advection {
   //
   template<int dim, int fe_degree, int n_q_points_1d, typename Vec>
   AdvectionOperator<dim, fe_degree, n_q_points_1d, Vec>::
-  AdvectionOperator(): MatrixFreeOperators::Base<dim, Vec>(), u(), dt(), HYPERBOLIC_stage(1) {}
+  AdvectionOperator(): MatrixFreeOperators::Base<dim, Vec>(), u(), dt() {}
 
 
   // Constructor with runtime parameters storage
@@ -80,7 +76,7 @@ namespace Advection {
   template<int dim, int fe_degree, int n_q_points_1d, typename Vec>
   AdvectionOperator<dim, fe_degree, n_q_points_1d, Vec>::
   AdvectionOperator(RunTimeParameters::Data_Storage& data): MatrixFreeOperators::Base<dim, Vec>(),
-                                                            u(data.initial_time), dt(data.dt), HYPERBOLIC_stage(1) {}
+                                                            u(data.initial_time), dt(data.dt) {}
 
 
   // Setter of time-step
@@ -89,19 +85,6 @@ namespace Advection {
   void AdvectionOperator<dim, fe_degree, n_q_points_1d, Vec>::
   set_dt(const double time_step) {
     dt = time_step;
-  }
-
-
-  // Setter of HYPERBOLIC stage (this can be known only during the effective execution
-  // and so it has to be demanded to the class that really solves the problem)
-  //
-  template<int dim, int fe_degree, int n_q_points_1d, typename Vec>
-  void AdvectionOperator<dim, fe_degree, n_q_points_1d, Vec>::
-  set_HYPERBOLIC_stage(const unsigned int stage) {
-    AssertIndexRange(stage, 4);
-    Assert(stage > 0, ExcInternalError());
-
-    HYPERBOLIC_stage = stage;
   }
 
 
