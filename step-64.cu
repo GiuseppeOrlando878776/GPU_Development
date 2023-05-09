@@ -36,14 +36,13 @@
 
 #include <deal.II/numerics/data_out.h>
 #include <deal.II/numerics/vector_tools.h>
+#include <deal.II/numerics/matrix_tools.h>
 
 // The following ones include the data structures for the
 // implementation of matrix-free methods on GPU:
 #include <deal.II/base/cuda.h>
 
-#include <deal.II/matrix_free/cuda_fe_evaluation.h>
-#include <deal.II/matrix_free/cuda_matrix_free.h>
-#include <deal.II/matrix_free/operators.h>
+#include <deal.II/lac/cuda_sparse_matrix.h>
 
 #include <fstream>
 
@@ -51,232 +50,6 @@
 //
 namespace Step64 {
   using namespace dealii;
-
-  // @sect3{Class <code>VaryingCoefficientFunctor</code>}
-
-  // Next, we define a class that implements the varying coefficients
-  // we want to use in the Helmholtz operator. Later, we want to pass
-  // an object of this type to a CUDAWrappers::MatrixFree
-  // object that expects the class to have an `operator()` that fills the
-  // values provided in the constructor for a given cell. This operator
-  // needs to run on the device, so it needs to be marked as `__device__`
-  // for the compiler.
-  //
-  template <int dim, int fe_degree, int n_q_points_1d>
-  class VaryingCoefficientFunctor {
-  public:
-    VaryingCoefficientFunctor(double* coefficient) : coef(coefficient)  {}
-
-    __device__ void operator() (const unsigned int                                          cell,
-                                const typename CUDAWrappers::MatrixFree<dim, double>::Data* gpu_data);
-
-    // Since CUDAWrappers::MatrixFree::Data doesn't know about the size of its
-    // arrays, we need to store the number of quadrature points and the numbers
-    // of degrees of freedom in this class to do necessary index conversions.
-    static const unsigned int n_dofs_1d    = fe_degree + 1;
-    static const unsigned int n_local_dofs = dealii::Utilities::pow(n_dofs_1d, dim);
-    static const unsigned int n_q_points   = dealii::Utilities::pow(n_q_points_1d, dim);
-
-  private:
-    double* coef;
-  };
-
-
-  // The following function implements this coefficient. Recall from
-  // the introduction that we have defined it as $a(\mathbf
-  // x)=\frac{10}{0.05 + 2\|\mathbf x\|^2}$
-  //
-  template <int dim, int fe_degree, int n_q_points_1d>
-  __device__ void VaryingCoefficientFunctor<dim, fe_degree, n_q_points_1d>::
-  operator()(const unsigned int                                          cell,
-             const typename CUDAWrappers::MatrixFree<dim, double>::Data* gpu_data) {
-    const unsigned int pos   = CUDAWrappers::local_q_point_id<dim, double>(cell, gpu_data, n_dofs_1d, n_q_points);
-    const Point<dim> q_point = CUDAWrappers::get_quadrature_point<dim, double>(cell, gpu_data, n_dofs_1d);
-
-    double p_square = 0.0;
-    for(unsigned int i = 0; i < dim; ++i) {
-      const double coord = q_point[i];
-      p_square += coord * coord;
-    }
-    coef[pos] = 10.0/(0.05 + 2.0*p_square);
-  }
-
-
-  // @sect3{Class <code>HelmholtzOperatorQuad</code>}
-
-  // The class `HelmholtzOperatorQuad` implements the evaluation of
-  // the Helmholtz operator at each quadrature point. It uses a
-  // similar mechanism as the MatrixFree framework introduced in
-  // step-37. In contrast to there, the actual quadrature point
-  // index is treated implicitly by converting the current thread
-  // index. As before, the functions of this class need to run on
-  // the device, so need to be marked as `__device__` for the
-  // compiler.
-  //
-  template <int dim, int fe_degree>
-  class HelmholtzOperatorQuad {
-  public:
-    __device__ HelmholtzOperatorQuad(double coef) : coef(coef) {}
-
-    __device__ void operator()(CUDAWrappers::FEEvaluation<dim, fe_degree>* fe_eval) const;
-
-  private:
-    double coef;
-  };
-
-
-  // The Helmholtz problem we want to solve here reads in weak form as follows:
-  // @f{eqnarray*}
-  //   (\nabla v, \nabla u)+ (v, a(\mathbf x) u) &=&(v,1) \quad \forall v.
-  // @f}
-  // If you have seen step-37, then it will be obvious that
-  // the two terms on the left-hand side correspond to the two function calls
-  // here:
-  template <int dim, int fe_degree>
-  __device__ void HelmholtzOperatorQuad<dim, fe_degree>::operator()(CUDAWrappers::FEEvaluation<dim, fe_degree>* fe_eval) const {
-    fe_eval->submit_value(coef*fe_eval->get_value());
-    fe_eval->submit_gradient(fe_eval->get_gradient());
-  }
-
-
-  // @sect3{Class <code>LocalHelmholtzOperator</code>}
-
-  // Finally, we need to define a class that implements the whole operator
-  // evaluation that corresponds to a matrix-vector product in matrix-based
-  // approaches.
-  //
-  template <int dim, int fe_degree, int n_q_points_1d>
-  class LocalHelmholtzOperator {
-  public:
-    LocalHelmholtzOperator(double* coefficient) : coef(coefficient) {}
-
-    __device__ void operator()(const unsigned int                                          cell,
-                               const typename CUDAWrappers::MatrixFree<dim, double>::Data* gpu_data,
-                               CUDAWrappers::SharedData<dim, double>*                      shared_data,
-                               const double*                                               src,
-                               double*                                                     dst) const;
-
-    // Again, the CUDAWrappers::MatrixFree object doesn't know about the number
-    // of degrees of freedom and the number of quadrature points so we need
-    // to store these for index calculations in the call operator.
-    static const unsigned int n_dofs_1d    = fe_degree + 1;
-    static const unsigned int n_local_dofs = Utilities::pow(n_dofs_1d, dim);
-    static const unsigned int n_q_points   = Utilities::pow(n_q_points_1d, dim);
-
-  private:
-    double* coef;
-  };
-
-
-  // This is the call operator that performs the Helmholtz operator evaluation
-  // on a given cell similar to the MatrixFree framework on the CPU.
-  // In particular, we need access to both values and gradients of the source
-  // vector and we write value and gradient information to the destination
-  // vector.
-  template <int dim, int fe_degree, int n_q_points_1d>
-  __device__ void LocalHelmholtzOperator<dim, fe_degree, n_q_points_1d>::
-  operator()(const unsigned int                                          cell,
-             const typename CUDAWrappers::MatrixFree<dim, double>::Data* gpu_data,
-             CUDAWrappers::SharedData<dim, double>*                      shared_data,
-             const double*                                               src,
-             double*                                                     dst) const {
-    const unsigned int pos = CUDAWrappers::local_q_point_id<dim, double>(cell, gpu_data, n_dofs_1d, n_q_points);
-
-    CUDAWrappers::FEEvaluation<dim, fe_degree, n_q_points_1d, 1, double> fe_eval(cell, gpu_data, shared_data);
-
-    fe_eval.read_dof_values(src);
-    fe_eval.evaluate(true, true); /*--- This two-stage procedure is necessary because gather_evaluate has not been defined ---*/
-
-    fe_eval.apply_for_each_quad_point(HelmholtzOperatorQuad<dim, fe_degree>(coef[pos]));
-
-    fe_eval.integrate(true, true);
-    fe_eval.distribute_local_to_global(dst); /*--- This two-stage procedure is necessary because integrate_scatter has not been defined ---*/
-  }
-
-
-  // @sect3{Class <code>HelmholtzOperator</code>}
-
-  // The `HelmholtzOperator` class acts as wrapper for
-  // `LocalHelmholtzOperator` defining an interface that can be used
-  // with linear solvers like SolverCG. In particular, like every
-  // class that implements the interface of a linear operator, it
-  // needs to have a `vmult()` function that performs the action of
-  // the linear operator on a source vector.
-  //
-  template <int dim, int fe_degree>
-  class HelmholtzOperator {
-  public:
-    HelmholtzOperator(const DoFHandler<dim>&           dof_handler,
-                      const AffineConstraints<double>& constraints);
-
-    void initialize_dof_vector(LinearAlgebra::CUDAWrappers::Vector<double>& vec) const;
-
-    void vmult(LinearAlgebra::CUDAWrappers::Vector<double>&       dst,
-               const LinearAlgebra::CUDAWrappers::Vector<double>& src) const;
-
-  private:
-    CUDAWrappers::MatrixFree<dim, double>       mf_data; /*--- Notice that this class cannot be dervied from MatrixFreeOperators::Base
-                                                               because we need CUDAWrappers::MatrixFree instance ---*/
-    LinearAlgebra::CUDAWrappers::Vector<double> coef;
-  };
-
-
-
-  // The following is the implementation of the constructor of this
-  // class. In the first part, we initialize the `mf_data` member
-  // variable that is going to provide us with the necessary
-  // information when evaluating the operator.
-  //
-  // In the second half, we need to store the value of the coefficient
-  // for each quadrature point in every active, locally owned cell.
-  //
-  template <int dim, int fe_degree>
-  HelmholtzOperator<dim, fe_degree>::HelmholtzOperator(const DoFHandler<dim>&           dof_handler,
-                                                       const AffineConstraints<double>& constraints) {
-    MappingQGeneric<dim> mapping(fe_degree); /*--- Mapping ---*/
-    typename CUDAWrappers::MatrixFree<dim, double>::AdditionalData additional_data; /*--- Additional data with flags to be initialized ---*/
-    additional_data.mapping_update_flags = update_values | update_gradients | update_JxW_values | update_quadrature_points;
-    const QGauss<1> quad(fe_degree + 1); /*--- Quadrature formula ---*/
-
-    mf_data.reinit(mapping, dof_handler, constraints, quad, additional_data); /*--- Reinit the matrix free structure ---*/
-
-    const unsigned int n_owned_cells = (&dof_handler.get_triangulation())->n_active_cells();
-    coef.reinit(Utilities::pow(fe_degree + 1, dim) * n_owned_cells);
-
-    const VaryingCoefficientFunctor<dim, fe_degree, fe_degree + 1> functor(coef.get_values());
-    mf_data.evaluate_coefficients(functor);
-  }
-
-
-  // Auxiliary function to initialize vectors since we cannot dervei from MatrixFreeOperators and, therefore,
-  // we cannot use a MatrixFree to directly initialize the HelmholtzOperator and the corresponding vectors.
-  //
-  template <int dim, int fe_degree>
-  void HelmholtzOperator<dim, fe_degree>::initialize_dof_vector(LinearAlgebra::CUDAWrappers::Vector<double>& vec) const {
-    mf_data.initialize_dof_vector(vec);
-  }
-
-
-  // The key step then is to use all of the previous classes to loop over
-  // all cells to perform the matrix-vector product. We implement this
-  // in the next function.
-  //
-  // When applying the Helmholtz operator, we have to be careful to handle
-  // boundary conditions correctly. Since the local operator doesn't know about
-  // constraints, we have to copy the correct values from the source to the
-  // destination vector afterwards.
-  //
-  template <int dim, int fe_degree>
-  void HelmholtzOperator<dim, fe_degree>::vmult(LinearAlgebra::CUDAWrappers::Vector<double>&       dst,
-                                                const LinearAlgebra::CUDAWrappers::Vector<double>& src) const {
-    dst = 0;
-    LocalHelmholtzOperator<dim, fe_degree, fe_degree + 1> helmholtz_operator(coef.get_values());
-    mf_data.cell_loop(helmholtz_operator, src, dst);
-    /*--- The cell_loop needs as first input argument a Functor with a __device__ void operator().
-          Hence, we need a class for the local action and a simple routine seems not to be sufficient because of the operator() request. ---*/
-    mf_data.copy_constrained_values(src, dst);
-  }
-
 
   // @sect3{Class <code>HelmholtzProblem</code>}
 
@@ -295,7 +68,7 @@ namespace Step64 {
   private:
     void setup_system();
 
-    void assemble_rhs();
+    void assemble_system();
 
     void solve();
 
@@ -306,8 +79,7 @@ namespace Step64 {
     FE_Q<dim>       fe;
     DoFHandler<dim> dof_handler;
 
-    AffineConstraints<double>                          constraints;
-    std::unique_ptr<HelmholtzOperator<dim, fe_degree>> system_matrix_dev;
+    AffineConstraints<double> constraints;
 
     // Since all the operations in the `solve()` function are executed on the
     // graphics card, it is necessary for the vectors used to store their values
@@ -315,6 +87,9 @@ namespace Step64 {
     //
     // In addition, we also keep a solution vector with CPU storage such that we
     // can view and display the solution as usual.
+    CUDAWrappers::SparseMatrix<double> system_matrix_dev;
+    SparsityPattern sparsity_pattern;
+
     LinearAlgebra::CUDAWrappers::Vector<double> solution_dev;
     LinearAlgebra::CUDAWrappers::Vector<double> system_rhs_dev;
 
@@ -341,73 +116,83 @@ namespace Step64 {
 
     constraints.clear();
     DoFTools::make_hanging_node_constraints(dof_handler, constraints);
-    VectorTools::interpolate_boundary_values(dof_handler, 0, Functions::ZeroFunction<dim>(), constraints);
     constraints.close();
 
-    ghost_solution_host.reinit(dof_handler.n_dofs());
+    DynamicSparsityPattern dsp(dof_handler.n_dofs());
+    DoFTools::make_sparsity_pattern(dof_handler, dsp);
+    sparsity_pattern.copy_from(dsp);
 
-    system_matrix_dev.reset(new HelmholtzOperator<dim, fe_degree>(dof_handler, constraints));
-    system_matrix_dev->initialize_dof_vector(solution_dev);
-    system_matrix_dev->initialize_dof_vector(system_rhs_dev);
+    solution_dev.reinit(dof_handler.n_dofs());
+    system_rhs_dev.reinit(dof_handler.n_dofs());
+
+    ghost_solution_host.reinit(dof_handler.n_dofs());
   }
 
 
-  // Unlike programs such as step-4 or step-6, we will not have to
-  // assemble the whole linear system but only the right hand side
-  // vector. This looks in essence like we did in step-4, for example,
-  // but we have to pay attention to using the right constraints
-  // object when copying local contributions into the global
-  // vector. In particular, we need to make sure the entries that
-  // correspond to boundary nodes are properly zeroed out. This is
-  // necessary for CG to converge.  (Another solution would be to
-  // modify the `vmult()` function above in such a way that we pretend
-  // the source vector has zero entries by just not taking them into
-  // account in matrix-vector products. But the approach used here is
-  // simpler.)
-  //
-  // At the end of the function, we can't directly copy the values
-  // from the host to the device but need to use an intermediate
-  // object of type LinearAlgebra::ReadWriteVector to construct the
-  // correct communication pattern necessary.
+  // We assemble now the matrix.
   //
   template <int dim, int fe_degree>
-  void HelmholtzProblem<dim, fe_degree>::assemble_rhs() {
+  void HelmholtzProblem<dim, fe_degree>::assemble_system() {
+    SparseMatrix<double> system_matrix_host;
+    system_matrix_host.reinit(sparsity_pattern);
+
     Vector<double> system_rhs_host(dof_handler.n_dofs());
 
     const QGauss<dim> quadrature_formula(fe_degree + 1);
-    FEValues<dim> fe_values(fe, quadrature_formula, update_values | update_quadrature_points | update_JxW_values);
+    FEValues<dim> fe_values(fe, quadrature_formula,
+                            update_values | update_gradients | update_quadrature_points | update_JxW_values);
 
     const unsigned int dofs_per_cell = fe.n_dofs_per_cell();
     const unsigned int n_q_points    = quadrature_formula.size();
 
-    Vector<double> cell_rhs(dofs_per_cell);
+    FullMatrix<double> cell_matrix(dofs_per_cell, dofs_per_cell);
+    Vector<double>     cell_rhs(dofs_per_cell);
 
     std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
 
+    std::map<types::global_dof_index, double> boundary_values;
+    VectorTools::interpolate_boundary_values(dof_handler, 0, Functions::ZeroFunction<dim>(), boundary_values);
+
     for(const auto& cell : dof_handler.active_cell_iterators()) {
+      cell_matrix = 0;
       cell_rhs = 0;
 
       fe_values.reinit(cell);
 
       for(unsigned int q_index = 0; q_index < n_q_points; ++q_index) {
+        const double coeff_aux = fe_values.get_quadrature_points()[q_index].norm_square();
         for(unsigned int i = 0; i < dofs_per_cell; ++i) {
+          for(unsigned int j = 0; j < dofs_per_cell; ++j) {
+            cell_matrix(i,j) += ((fe_values.shape_grad(i, q_index)*fe_values.shape_grad(j, q_index) +
+                                 10.0/(0.05 + 2.0*coeff_aux)*fe_values.shape_value(i, q_index)*fe_values.shape_value(j, q_index))*
+                                 fe_values.JxW(q_index));
+          }
+
           cell_rhs(i) += (fe_values.shape_value(i, q_index) * 1.0 *
                           fe_values.JxW(q_index));
         }
       }
 
       cell->get_dof_indices(local_dof_indices);
-      constraints.distribute_local_to_global(cell_rhs,
+
+      MatrixTools::local_apply_boundary_values(boundary_values, local_dof_indices, cell_matrix, cell_rhs, true);
+
+      constraints.distribute_local_to_global(cell_matrix,
+                                             cell_rhs,
                                              local_dof_indices,
+                                             system_matrix_host,
                                              system_rhs_host);
     }
+    system_matrix_host.compress(VectorOperation::add);
     system_rhs_host.compress(VectorOperation::add);
+
+    Utilities::CUDA::Handle cuda_handle;
+    system_matrix_dev.reinit(cuda_handle, system_matrix_host);
 
     LinearAlgebra::ReadWriteVector<double> rw_vector(dof_handler.n_dofs());
     rw_vector.import(system_rhs_host, VectorOperation::insert);
     system_rhs_dev.import(rw_vector, VectorOperation::insert);
   }
-
 
 
   // This solve() function finally contains the calls to the new classes
@@ -429,7 +214,7 @@ namespace Step64 {
 
     SolverControl solver_control(system_rhs_dev.size(), 1e-12*system_rhs_dev.l2_norm());
     SolverCG<LinearAlgebra::CUDAWrappers::Vector<double>> cg(solver_control);
-    cg.solve(*system_matrix_dev, solution_dev, system_rhs_dev, preconditioner);
+    cg.solve(system_matrix_dev, solution_dev, system_rhs_dev, preconditioner);
 
     pcout << "  Solved in " << solver_control.last_step() << " iterations."
           << std::endl;
@@ -506,7 +291,7 @@ namespace Step64 {
             << "   Number of degrees of freedom: " << dof_handler.n_dofs()
             << std::endl;
 
-      assemble_rhs();
+      assemble_system();
       solve();
       output_results(cycle);
       pcout << std::endl;
@@ -529,7 +314,7 @@ int main(int argc, char *argv[]) {
     int         n_devices       = 0;
     cudaError_t cuda_error_code = cudaGetDeviceCount(&n_devices);
     AssertCuda(cuda_error_code);
-    cuda_error_code     = cudaSetDevice(0);
+    cuda_error_code = cudaSetDevice(0);
     AssertCuda(cuda_error_code);
 
     HelmholtzProblem<3, 3> helmholtz_problem;
