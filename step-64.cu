@@ -229,12 +229,6 @@ namespace Step64 {
   //
   // In the second half, we need to store the value of the coefficient
   // for each quadrature point in every active, locally owned cell.
-  // We can ask the parallel triangulation for the number of active, locally
-  // owned cells but only have a DoFHandler object at hand. Since
-  // DoFHandler::get_triangulation() returns a Triangulation object, not a
-  // parallel::TriangulationBase object, we have to downcast the return value.
-  // This is safe to do here because we know that the triangulation is a
-  // parallel:distributed::Triangulation object in fact.
   //
   template <int dim, int fe_degree>
   HelmholtzOperator<dim, fe_degree>::HelmholtzOperator(const DoFHandler<dim>&           dof_handler,
@@ -246,8 +240,7 @@ namespace Step64 {
 
     mf_data.reinit(mapping, dof_handler, constraints, quad, additional_data); /*--- Reinit the matrix free structure ---*/
 
-    const unsigned int n_owned_cells = dynamic_cast<const parallel::TriangulationBase<dim>*>
-                                       (&dof_handler.get_triangulation())->n_locally_owned_active_cells();
+    const unsigned int n_owned_cells = (&dof_handler.get_triangulation())->n_active_cells();
     coef.reinit(Utilities::pow(fe_degree + 1, dim) * n_owned_cells);
 
     const VaryingCoefficientFunctor<dim, fe_degree, fe_degree + 1> functor(coef.get_values());
@@ -308,9 +301,7 @@ namespace Step64 {
 
     void output_results(const unsigned int cycle) const;
 
-    MPI_Comm mpi_communicator;
-
-    parallel::distributed::Triangulation<dim> triangulation;
+    Triangulation<dim> triangulation;
 
     FE_Q<dim>       fe;
     DoFHandler<dim> dof_handler;
@@ -348,11 +339,10 @@ namespace Step64 {
   // further comment much on the overall approach.
   //
   template <int dim, int fe_degree>
-  HelmholtzProblem<dim, fe_degree>::HelmholtzProblem() : mpi_communicator(MPI_COMM_WORLD),
-                                                         triangulation(mpi_communicator),
+  HelmholtzProblem<dim, fe_degree>::HelmholtzProblem() : triangulation(),
                                                          fe(fe_degree),
                                                          dof_handler(triangulation),
-                                                         pcout(std::cout, Utilities::MPI::this_mpi_process(mpi_communicator) == 0) {}
+                                                         pcout(std::cout) {}
 
 
   template <int dim, int fe_degree>
@@ -363,14 +353,11 @@ namespace Step64 {
     DoFTools::extract_locally_relevant_dofs(dof_handler, locally_relevant_dofs);
 
     constraints.clear();
-    constraints.reinit(locally_relevant_dofs);
     DoFTools::make_hanging_node_constraints(dof_handler, constraints);
     VectorTools::interpolate_boundary_values(dof_handler, 0, Functions::ZeroFunction<dim>(), constraints);
     constraints.close();
 
-    ghost_solution_host.reinit(locally_owned_dofs,
-                               locally_relevant_dofs,
-                               mpi_communicator);
+    ghost_solution_host.reinit(dof_handler.n_dofs());
 
     system_matrix_dev.reset(new HelmholtzOperator<dim, fe_degree>(dof_handler, constraints));
     system_matrix_dev->initialize_dof_vector(solution_dev);
@@ -398,9 +385,7 @@ namespace Step64 {
   //
   template <int dim, int fe_degree>
   void HelmholtzProblem<dim, fe_degree>::assemble_rhs() {
-    LinearAlgebra::distributed::Vector<double, MemorySpace::Host> system_rhs_host(locally_owned_dofs,
-                                                                                  locally_relevant_dofs,
-                                                                                  mpi_communicator);
+    LinearAlgebra::distributed::Vector<double, MemorySpace::Host> system_rhs_host(dof_handler.n_dofs());
     const QGauss<dim> quadrature_formula(fe_degree + 1);
 
     FEValues<dim> fe_values(fe, quadrature_formula, update_values | update_quadrature_points | update_JxW_values);
@@ -413,23 +398,21 @@ namespace Step64 {
     std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
 
     for(const auto& cell : dof_handler.active_cell_iterators()) {
-      if(cell->is_locally_owned()) {
-        cell_rhs = 0;
+      cell_rhs = 0;
 
-        fe_values.reinit(cell);
+      fe_values.reinit(cell);
 
-        for(unsigned int q_index = 0; q_index < n_q_points; ++q_index) {
-          for(unsigned int i = 0; i < dofs_per_cell; ++i) {
-            cell_rhs(i) += (fe_values.shape_value(i, q_index) * 1.0 *
-                            fe_values.JxW(q_index));
-          }
+      for(unsigned int q_index = 0; q_index < n_q_points; ++q_index) {
+        for(unsigned int i = 0; i < dofs_per_cell; ++i) {
+          cell_rhs(i) += (fe_values.shape_value(i, q_index) * 1.0 *
+                          fe_values.JxW(q_index));
         }
-
-        cell->get_dof_indices(local_dof_indices);
-        constraints.distribute_local_to_global(cell_rhs,
-                                               local_dof_indices,
-                                               system_rhs_host);
       }
+
+      cell->get_dof_indices(local_dof_indices);
+      constraints.distribute_local_to_global(cell_rhs,
+                                             local_dof_indices,
+                                             system_rhs_host);
     }
     system_rhs_host.compress(VectorOperation::add);
 
@@ -499,7 +482,8 @@ namespace Step64 {
     DataOutBase::VtkFlags flags;
     flags.compression_level = DataOutBase::VtkFlags::best_speed;
     data_out.set_flags(flags);
-    data_out.write_vtu_with_pvtu_record("./", "solution", cycle, mpi_communicator, 2);
+    std::ofstream output_file("./solution_" + std::to_string(cycle) + ".vtu");
+    data_out.write_vtu(output_file);
 
     Vector<float> cellwise_norm(triangulation.n_active_cells());
     VectorTools::integrate_difference(dof_handler,
@@ -548,34 +532,17 @@ namespace Step64 {
 
 // Finally for the `main()` function.  By default, all the MPI ranks
 // will try to access the device with number 0, which we assume to be
-// the GPU device associated with the CPU on which a particular MPI
-// rank runs. This works, but if we are running with MPI support it
-// may be that multiple MPI processes are running on the same machine
-// (for example, one per CPU core) and then they would all want to
-// access the same GPU on that machine. If there is only one GPU in
-// the machine, there is nothing we can do about it: All MPI ranks on
-// that machine need to share it. But if there are more than one GPU,
-// then it is better to address different graphic cards for different
-// processes. The choice below is based on the MPI process id by
-// assigning GPUs round robin to GPU ranks. (To work correctly, this
-// scheme assumes that the MPI ranks on one machine are
-// consecutive. If that were not the case, then the rank-GPU
-// association may just not be optimal.) To make this work, MPI needs
-// to be initialized before using this function.
+// the GPU device associated with the CPU.
 //
 int main(int argc, char *argv[]) {
   try
   {
     using namespace Step64;
 
-    Utilities::MPI::MPI_InitFinalize mpi_init(argc, argv, 1);
-
     int         n_devices       = 0;
     cudaError_t cuda_error_code = cudaGetDeviceCount(&n_devices);
     AssertCuda(cuda_error_code);
-    const unsigned int my_mpi_id = Utilities::MPI::this_mpi_process(MPI_COMM_WORLD);
-    const int device_id = my_mpi_id % n_devices;
-    cuda_error_code     = cudaSetDevice(device_id);
+    cuda_error_code     = cudaSetDevice(0);
     AssertCuda(cuda_error_code);
 
     HelmholtzProblem<3, 3> helmholtz_problem;
