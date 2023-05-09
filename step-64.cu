@@ -209,10 +209,10 @@ namespace Step64 {
     HelmholtzOperator(const DoFHandler<dim>&           dof_handler,
                       const AffineConstraints<double>& constraints);
 
-    void initialize_dof_vector(LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>& vec) const;
+    void initialize_dof_vector(LinearAlgebra::CUDAWrappers::Vector<double>& vec) const;
 
-    void vmult(LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>&       dst,
-               const LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>& src) const;
+    void vmult(LinearAlgebra::CUDAWrappers::Vector<double>&       dst,
+               const LinearAlgebra::CUDAWrappers::Vector<double>& src) const;
 
   private:
     CUDAWrappers::MatrixFree<dim, double>       mf_data; /*--- Notice that this class cannot be dervied from MatrixFreeOperators::Base
@@ -252,7 +252,7 @@ namespace Step64 {
   // we cannot use a MatrixFree to directly initialize the HelmholtzOperator and the corresponding vectors.
   //
   template <int dim, int fe_degree>
-  void HelmholtzOperator<dim, fe_degree>::initialize_dof_vector(LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>& vec) const {
+  void HelmholtzOperator<dim, fe_degree>::initialize_dof_vector(LinearAlgebra::CUDAWrappers::Vector<double>& vec) const {
     mf_data.initialize_dof_vector(vec);
   }
 
@@ -267,8 +267,8 @@ namespace Step64 {
   // destination vector afterwards.
   //
   template <int dim, int fe_degree>
-  void HelmholtzOperator<dim, fe_degree>::vmult(LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>&       dst,
-                                                const LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>& src) const {
+  void HelmholtzOperator<dim, fe_degree>::vmult(LinearAlgebra::CUDAWrappers::Vector<double>&       dst,
+                                                const LinearAlgebra::CUDAWrappers::Vector<double>& src) const {
     dst = 0;
     LocalHelmholtzOperator<dim, fe_degree, fe_degree + 1> helmholtz_operator(coef.get_values());
     mf_data.cell_loop(helmholtz_operator, src, dst);
@@ -306,27 +306,17 @@ namespace Step64 {
     FE_Q<dim>       fe;
     DoFHandler<dim> dof_handler;
 
-    IndexSet locally_owned_dofs;
-    IndexSet locally_relevant_dofs;
-
     AffineConstraints<double>                          constraints;
     std::unique_ptr<HelmholtzOperator<dim, fe_degree>> system_matrix_dev;
 
     // Since all the operations in the `solve()` function are executed on the
     // graphics card, it is necessary for the vectors used to store their values
-    // on the GPU as well. LinearAlgebra::distributed::Vector can be told which
-    // memory space to use. There is also LinearAlgebra::CUDAWrappers::Vector
-    // that always uses GPU memory storage but doesn't work with MPI. It might
-    // be worth noticing that the communication between different MPI processes
-    // can be improved if the MPI implementation is CUDA-aware and the configure
-    // flag `DEAL_II_MPI_WITH_CUDA_SUPPORT` is enabled. (The value of this
-    // flag needs to be set at the time you call `cmake` when installing
-    // deal.II.)
+    // on the GPU as well.
     //
     // In addition, we also keep a solution vector with CPU storage such that we
     // can view and display the solution as usual.
-    LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA> solution_dev;
-    LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA> system_rhs_dev;
+    LinearAlgebra::CUDAWrappers::Vector<double> solution_dev;
+    LinearAlgebra::CUDAWrappers::Vector<double> system_rhs_dev;
 
     LinearAlgebra::distributed::Vector<double, MemorySpace::Host> ghost_solution_host;
 
@@ -348,9 +338,6 @@ namespace Step64 {
   template <int dim, int fe_degree>
   void HelmholtzProblem<dim, fe_degree>::setup_system() {
     dof_handler.distribute_dofs(fe);
-
-    locally_owned_dofs = dof_handler.locally_owned_dofs();
-    DoFTools::extract_locally_relevant_dofs(dof_handler, locally_relevant_dofs);
 
     constraints.clear();
     DoFTools::make_hanging_node_constraints(dof_handler, constraints);
@@ -385,9 +372,9 @@ namespace Step64 {
   //
   template <int dim, int fe_degree>
   void HelmholtzProblem<dim, fe_degree>::assemble_rhs() {
-    LinearAlgebra::distributed::Vector<double, MemorySpace::Host> system_rhs_host(dof_handler.n_dofs());
-    const QGauss<dim> quadrature_formula(fe_degree + 1);
+    Vector<double> system_rhs_host(dof_handler.n_dofs());
 
+    const QGauss<dim> quadrature_formula(fe_degree + 1);
     FEValues<dim> fe_values(fe, quadrature_formula, update_values | update_quadrature_points | update_JxW_values);
 
     const unsigned int dofs_per_cell = fe.n_dofs_per_cell();
@@ -416,7 +403,7 @@ namespace Step64 {
     }
     system_rhs_host.compress(VectorOperation::add);
 
-    LinearAlgebra::ReadWriteVector<double> rw_vector(locally_owned_dofs);
+    LinearAlgebra::ReadWriteVector<double> rw_vector(dof_handler.n_dofs());
     rw_vector.import(system_rhs_host, VectorOperation::insert);
     system_rhs_dev.import(rw_vector, VectorOperation::insert);
   }
@@ -441,13 +428,13 @@ namespace Step64 {
     PreconditionIdentity preconditioner;
 
     SolverControl solver_control(system_rhs_dev.size(), 1e-12*system_rhs_dev.l2_norm());
-    SolverCG<LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>> cg(solver_control);
+    SolverCG<LinearAlgebra::CUDAWrappers::Vector<double>> cg(solver_control);
     cg.solve(*system_matrix_dev, solution_dev, system_rhs_dev, preconditioner);
 
     pcout << "  Solved in " << solver_control.last_step() << " iterations."
           << std::endl;
 
-    LinearAlgebra::ReadWriteVector<double> rw_vector(locally_owned_dofs);
+    LinearAlgebra::ReadWriteVector<double> rw_vector(dof_handler.n_dofs());
     rw_vector.import(solution_dev, VectorOperation::insert);
     ghost_solution_host.import(rw_vector, VectorOperation::insert);
 
