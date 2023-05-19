@@ -17,7 +17,7 @@
 namespace EquationData {
   using namespace dealii;
 
-  static const unsigned int degree = 3;   /*--- Polynomial degree ---*/
+  static const unsigned int degree = 2;   /*--- Polynomial degree ---*/
 
   // We declare now the class that describes the velocity.
   //
@@ -95,7 +95,7 @@ namespace EquationData {
     const double X     = (p[0] - x0)/sigma;
     const double Y     = (p[1] - y0)/sigma;
 
-    return 1.0*((X*X + Y*Y) <= 1);
+    return (0.25*(1.0 + std::cos(numbers::PI*X))*(1.0 + std::cos(numbers::PI*Y)))*((X*X + Y*Y) <= 1);
   }
 
 } // namespace EquationData

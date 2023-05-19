@@ -196,11 +196,6 @@ void AdvectionSolver<dim>::create_triangulation(const unsigned int n_refines) {
 
   GridGenerator::subdivided_hyper_cube(triangulation, 15, -0.5, 0.5, true);
 
-  std::vector<GridTools::PeriodicFacePair<typename parallel::distributed::Triangulation<dim>::cell_iterator>> periodic_faces;
-  GridTools::collect_periodic_faces(triangulation, 0, 1, 0, periodic_faces);
-  GridTools::collect_periodic_faces(triangulation, 2, 3, 1, periodic_faces);
-  triangulation.add_periodicity(periodic_faces);
-
   triangulation.refine_global(n_refines);
 }
 
@@ -245,6 +240,7 @@ void AdvectionSolver<dim>::setup_dofs() {
   /*--- Set the container with the constraints. Each entry is empty (no Dirichlet and weak imposition in general)
         and this is necessary only for compatibilty reasons ---*/
   constraints.push_back(&constraints_velocity);
+  DoFTools::make_hanging_node_constraints(dof_handler_density, constraints_density);
   DoFTools::make_periodicity_constraints(dof_handler_density, 0, 1, 0, constraints_density);
   DoFTools::make_periodicity_constraints(dof_handler_density, 2, 3, 1, constraints_density);
   constraints_density.close();
@@ -309,6 +305,8 @@ void AdvectionSolver<dim>::update_density() {
   if(HYPERBOLIC_stage == 1) {
     rho_tmp_2.equ(1.0, rho_old);
     cg.solve(advection_matrix, rho_tmp_2, rhs_rho, PreconditionIdentity());
+
+    constraints_density.distribute(rho_tmp_2);
   }
   else if(HYPERBOLIC_stage == 2) {
     rho_tmp_3.equ(1.0, rho_tmp_2);
@@ -316,6 +314,8 @@ void AdvectionSolver<dim>::update_density() {
 
     rho_tmp_3 *= 0.25;
     rho_tmp_3.add(0.75, rho_old);
+
+    constraints_density.distribute(rho_tmp_3);
   }
   else {
     rho_curr.equ(1.0, rho_tmp_3);
@@ -323,6 +323,8 @@ void AdvectionSolver<dim>::update_density() {
 
     rho_curr *= 2.0/3.0;
     rho_curr.add(1.0/3.0, rho_old);
+
+    constraints_density.distribute(rho_curr);
   }
 }
 
