@@ -23,6 +23,7 @@
 
 #include <fstream>
 
+#include "runtime_parameters.h"
 #include "equation_data.h"
 
 // As usual, we enclose everything into a namespace of its own:
@@ -35,12 +36,12 @@ namespace AdvectionSolver {
   template <int dim, int fe_degree>
   class AdvectionProblem {
   public:
-    AdvectionProblem();
+    AdvectionProblem(RunTimeParameters::Data_Storage& data);
 
     void run();
 
   private:
-    void create_triangulation();
+    void create_triangulation(const unsigned int n_refines);
 
     void setup_system();
 
@@ -76,28 +77,45 @@ namespace AdvectionSolver {
 
     EquationData::Density<dim>  density;
     EquationData::Velocity<dim> velocity;
-    double dt = 0.00024543692;
-    double T  = 6.28318530718;
+
+    const double t_0; /*--- Initial time auxiliary variable ----*/
+    const double T;   /*--- Final time auxiliary variable ----*/
+    double       dt;  /*--- Time step auxiliary variable ---*/
+    unsigned int n_refines;  /*--- Number of refinements auxiliary variable ---*/
+
+    unsigned int max_its; /*--- Auxiliary variable for the maximum number of iterations of linear solvers ---*/
+    double       eps;     /*--- Auxiliary variable for the tolerance of linear solvers ---*/
+
+    std::string  saving_dir; /*--- Auxiliary variable for the directory to save the results ---*/
+    unsigned int output_interval; /* --- Auxiliary variable for the number of iterations to save the results ---*/
   };
 
 
   // Class constructor
   //
   template <int dim, int fe_degree>
-  AdvectionProblem<dim, fe_degree>::AdvectionProblem() : triangulation(),
-                                                         fe(fe_degree),
-                                                         dof_handler(triangulation),
-                                                         pcout(std::cout),
-                                                         density(),
-                                                         velocity() {}
+  AdvectionProblem<dim, fe_degree>::AdvectionProblem(RunTimeParameters::Data_Storage& data) : triangulation(),
+                                                                                              fe(fe_degree),
+                                                                                              dof_handler(triangulation),
+                                                                                              pcout(std::cout),
+                                                                                              density(),
+                                                                                              velocity(),
+                                                                                              t_0(data.initial_time),
+                                                                                              T(data.final_time),
+                                                                                              dt(data.dt),
+                                                                                              n_refines(data.n_global_refines),
+                                                                                              max_its(data.max_iterations),
+                                                                                              eps(data.eps),
+                                                                                              saving_dir(data.dir),
+                                                                                              output_interval(data.output_interval) {}
 
   // Build the domain
   //
   template<int dim, int fe_degree>
-  void AdvectionProblem<dim, fe_degree>::create_triangulation() {
+  void AdvectionProblem<dim, fe_degree>::create_triangulation(const unsigned int n_refines) {
     GridGenerator::subdivided_hyper_cube(triangulation, 15, -0.5, 0.5, true);
 
-    triangulation.refine_global(3);
+    triangulation.refine_global(n_refines);
   }
 
 
@@ -215,7 +233,7 @@ namespace AdvectionSolver {
   void AdvectionProblem<dim, fe_degree>::solve() {
     PreconditionIdentity preconditioner;
 
-    SolverControl solver_control(10000, 1e-6*system_rhs_dev.l2_norm());
+    SolverControl solver_control(max_its, eps*system_rhs_dev.l2_norm());
     SolverCG<LinearAlgebra::CUDAWrappers::Vector<double>> cg(solver_control);
     cg.solve(system_matrix_dev, solution_dev, system_rhs_dev, preconditioner);
 
@@ -225,6 +243,7 @@ namespace AdvectionSolver {
 
     constraints.distribute(solution_host);
   }
+
 
   // The output results function is as usual since we have already copied the
   // values back from the GPU to the CPU.
@@ -242,7 +261,7 @@ namespace AdvectionSolver {
     DataOutBase::VtkFlags flags;
     flags.compression_level = DataOutBase::VtkFlags::best_speed;
     data_out.set_flags(flags);
-    std::ofstream output_file("./solution_" + Utilities::int_to_string(step, 5) + ".vtu");
+    std::ofstream output_file("./" + saving_dir + "/solution_" + Utilities::int_to_string(step, 5) + ".vtu");
     data_out.write_vtu(output_file);
   }
 
@@ -252,12 +271,12 @@ namespace AdvectionSolver {
   //
   template <int dim, int fe_degree>
   void AdvectionProblem<dim, fe_degree>::run() {
-    create_triangulation();
+    create_triangulation(n_refines);
     setup_system();
     initialize();
 
     output_results(0);
-    double time    = 0.0;
+    double time    = t_0;
     unsigned int n = 0;
 
     while(std::abs(T - time) > 1e-10) {
@@ -280,7 +299,7 @@ namespace AdvectionSolver {
       solution_host *= 2.0/3.0;
       solution_host.add(1.0/3.0, solution_host_old);
 
-      if(n % 2560 == 0) {
+      if(n % output_interval == 0) {
         output_results(n);
       }
       if(T - time < dt && T - time > 1e-10) {
@@ -302,13 +321,18 @@ int main(int argc, char *argv[]) {
   {
     using namespace AdvectionSolver;
 
+    RunTimeParameters::Data_Storage data;
+    data.read_data("parameter-file.prm");
+
+    deallog.depth_console(2);
+
     int         n_devices       = 0;
     cudaError_t cuda_error_code = cudaGetDeviceCount(&n_devices);
     AssertCuda(cuda_error_code);
     cuda_error_code = cudaSetDevice(0);
     AssertCuda(cuda_error_code);
 
-    AdvectionProblem<2, EquationData::degree> advection_problem;
+    AdvectionProblem<2, EquationData::degree> advection_problem(data);
     advection_problem.run();
   }
   catch(std::exception &exc)
