@@ -20,8 +20,13 @@
 #include <deal.II/base/cuda.h>
 
 #include <deal.II/lac/cuda_sparse_matrix.h>
+#include <deal.II/lac/cuda_precondition.h>
 
 #include <fstream>
+
+#include <deal.II/meshworker/mesh_loop.h>
+#include <deal.II/meshworker/scratch_data.h>
+#include <deal.II/meshworker/copy_data.h>
 
 #include "runtime_parameters.h"
 #include "equation_data.h"
@@ -163,29 +168,25 @@ namespace AdvectionSolver {
 
     Vector<double> system_rhs_host(dof_handler.n_dofs());
 
-    const QGauss<dim> quadrature_formula(2*fe_degree + 1);
-    FEValues<dim> fe_values(fe, quadrature_formula,
-                            update_values | update_gradients | update_quadrature_points | update_JxW_values);
+    using Iterator = typename DoFHandler<dim>::active_cell_iterator;
 
-    const unsigned int dofs_per_cell = fe.n_dofs_per_cell();
-    const unsigned int n_q_points    = quadrature_formula.size();
+    const auto cell_worker = [&](const Iterator&                    cell,
+                                 MeshWorker::ScratchData<dim, dim>& scratch_data,
+                                 MeshWorker::CopyData<1, 1, 1>&     copy_data) {
+      const FEValues<dim>& fe_values = scratch_data.reinit(cell);
 
-    FullMatrix<double> cell_matrix(dofs_per_cell, dofs_per_cell);
-    Vector<double>     cell_rhs(dofs_per_cell);
+      const unsigned int dofs_per_cell = fe_values.get_fe().n_dofs_per_cell();
 
-    std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
-
-    std::vector<double> old_solution_values(n_q_points);
-    std::vector<Tensor<1, dim>> old_solution_gradients(n_q_points);
-
-    for(const auto& cell : dof_handler.active_cell_iterators()) {
-      cell_matrix = 0;
-      cell_rhs    = 0;
-
-      fe_values.reinit(cell);
+      const unsigned int n_q_points = fe_values.n_quadrature_points;
+      std::vector<double> old_solution_values(n_q_points);
+      std::vector<Tensor<1, dim>> old_solution_gradients(n_q_points);
 
       fe_values.get_function_values(solution_host, old_solution_values);
       fe_values.get_function_gradients(solution_host, old_solution_gradients);
+
+      copy_data.matrices[0] = 0;
+      copy_data.vectors[0] = 0;
+      cell->get_dof_indices(copy_data.local_dof_indices[0]);
 
       for(unsigned int q_index = 0; q_index < n_q_points; ++q_index) {
         const auto& x_q = fe_values.quadrature_point(q_index);
@@ -196,27 +197,38 @@ namespace AdvectionSolver {
 
         for(unsigned int i = 0; i < dofs_per_cell; ++i) {
           for(unsigned int j = 0; j < dofs_per_cell; ++j) {
-            cell_matrix(i,j) += fe_values.shape_value(i, q_index)*
-                                (fe_values.shape_value(j, q_index))*
-                                fe_values.JxW(q_index);
+            copy_data.matrices[0](i, j) += fe_values.shape_value(i, q_index)*
+                                           (fe_values.shape_value(j, q_index))*
+                                           fe_values.JxW(q_index);
           }
 
-          cell_rhs(i) += fe_values.shape_value(i, q_index)*
-                         (old_solution_values[q_index] - dt*scalar_product(u, old_solution_gradients[q_index]))*
-                         fe_values.JxW(q_index);
+          copy_data.vectors[0](i) += fe_values.shape_value(i, q_index)*
+                                     (old_solution_values[q_index] - dt*scalar_product(u, old_solution_gradients[q_index]))*
+                                     fe_values.JxW(q_index);
         }
       }
+    };
 
-      cell->get_dof_indices(local_dof_indices);
-
-      constraints.distribute_local_to_global(cell_matrix,
-                                             cell_rhs,
-                                             local_dof_indices,
+    const auto copier = [&](const MeshWorker::CopyData<1, 1, 1>& c) {
+      constraints.distribute_local_to_global(c.matrices[0],
+                                             c.vectors[0],
+                                             c.local_dof_indices[0],
                                              system_matrix_host,
                                              system_rhs_host);
-    }
-    system_matrix_host.compress(VectorOperation::add);
-    system_rhs_host.compress(VectorOperation::add);
+    };
+
+    const QGauss<dim> quadrature_formula(2*fe_degree + 1);
+    const UpdateFlags& update_flags = update_values | update_gradients | update_quadrature_points | update_JxW_values;
+
+    MeshWorker::ScratchData<dim, dim> scratch_data(fe, quadrature_formula, update_flags);
+    MeshWorker::CopyData<1, 1, 1> copy_data(fe.n_dofs_per_cell());
+
+    MeshWorker::mesh_loop(dof_handler.begin_active(),
+                          dof_handler.end(),
+                          cell_worker,
+                          copier,
+                          scratch_data,
+                          copy_data);
 
     Utilities::CUDA::Handle cuda_handle;
     system_matrix_dev.reinit(cuda_handle, system_matrix_host);
