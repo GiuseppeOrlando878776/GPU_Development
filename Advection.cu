@@ -1,9 +1,11 @@
+/*--- Author: Giuseppe Orlando, 2023 ---*/
+
 #include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/quadrature_lib.h>
 
 #include <deal.II/dofs/dof_tools.h>
 
-#include <deal.II/fe/fe_q.h>
+#include <deal.II/fe/fe_dgq.h>
 
 #include <deal.II/grid/grid_generator.h>
 #include <deal.II/grid/tria.h>
@@ -28,6 +30,8 @@
 #include <deal.II/meshworker/scratch_data.h>
 #include <deal.II/meshworker/copy_data.h>
 
+#include <deal.II/fe/fe_interface_values.h>
+
 #include "runtime_parameters.h"
 #include "equation_data.h"
 
@@ -35,6 +39,29 @@
 //
 namespace AdvectionSolver {
   using namespace dealii;
+
+  struct CopyDataFace {
+    Vector<double>                       cell_rhs;
+    std::vector<types::global_dof_index> joint_dof_indices;
+  };
+
+
+  struct CopyData {
+    FullMatrix<double>                   cell_matrix;
+    Vector<double>                       cell_rhs;
+    std::vector<types::global_dof_index> local_dof_indices;
+    std::vector<CopyDataFace>            face_data;
+
+    template<class Iterator>
+    void reinit(const Iterator& cell, unsigned int dofs_per_cell) {
+      cell_matrix.reinit(dofs_per_cell, dofs_per_cell);
+      cell_rhs.reinit(dofs_per_cell);
+
+      local_dof_indices.resize(dofs_per_cell);
+      cell->get_dof_indices(local_dof_indices);
+    }
+  };
+
 
   // @sect{Class <code>AdvectionProblem</code>}
 
@@ -60,7 +87,7 @@ namespace AdvectionSolver {
 
     Triangulation<dim> triangulation;
 
-    FE_Q<dim>       fe;
+    FE_DGQ<dim>     fe;
     DoFHandler<dim> dof_handler;
 
     AffineConstraints<double> constraints;
@@ -130,14 +157,16 @@ namespace AdvectionSolver {
   void AdvectionProblem<dim, fe_degree>::setup_system() {
     dof_handler.distribute_dofs(fe);
 
+    pcout << "dim (Q_h) = " << dof_handler.n_dofs() << std::endl
+          << std::endl;
+
     constraints.clear();
-    DoFTools::make_hanging_node_constraints(dof_handler, constraints);
     DoFTools::make_periodicity_constraints(dof_handler, 0, 1, 0, constraints);
     DoFTools::make_periodicity_constraints(dof_handler, 2, 3, 1, constraints);
     constraints.close();
 
     DynamicSparsityPattern dsp(dof_handler.n_dofs());
-    DoFTools::make_sparsity_pattern(dof_handler, dsp, constraints);
+    DoFTools::make_flux_sparsity_pattern(dof_handler, dsp, constraints);
     sparsity_pattern.copy_from(dsp);
 
     solution_dev.reinit(dof_handler.n_dofs());
@@ -172,21 +201,17 @@ namespace AdvectionSolver {
 
     const auto cell_worker = [&](const Iterator&                    cell,
                                  MeshWorker::ScratchData<dim, dim>& scratch_data,
-                                 MeshWorker::CopyData<1, 1, 1>&     copy_data) {
+                                 CopyData&                          copy_data) {
       const FEValues<dim>& fe_values = scratch_data.reinit(cell);
 
       const unsigned int dofs_per_cell = fe_values.get_fe().n_dofs_per_cell();
 
       const unsigned int n_q_points = fe_values.n_quadrature_points;
       std::vector<double> old_solution_values(n_q_points);
-      std::vector<Tensor<1, dim>> old_solution_gradients(n_q_points);
 
       fe_values.get_function_values(solution_host, old_solution_values);
-      fe_values.get_function_gradients(solution_host, old_solution_gradients);
 
-      copy_data.matrices[0] = 0;
-      copy_data.vectors[0] = 0;
-      cell->get_dof_indices(copy_data.local_dof_indices[0]);
+      copy_data.reinit(cell, dofs_per_cell);
 
       for(unsigned int q_index = 0; q_index < n_q_points; ++q_index) {
         const auto& x_q = fe_values.quadrature_point(q_index);
@@ -197,38 +222,106 @@ namespace AdvectionSolver {
 
         for(unsigned int i = 0; i < dofs_per_cell; ++i) {
           for(unsigned int j = 0; j < dofs_per_cell; ++j) {
-            copy_data.matrices[0](i, j) += fe_values.shape_value(i, q_index)*
+            copy_data.cell_matrix(i, j) += fe_values.shape_value(i, q_index)*
                                            (fe_values.shape_value(j, q_index))*
                                            fe_values.JxW(q_index);
           }
 
-          copy_data.vectors[0](i) += fe_values.shape_value(i, q_index)*
-                                     (old_solution_values[q_index] - dt*scalar_product(u, old_solution_gradients[q_index]))*
-                                     fe_values.JxW(q_index);
+          copy_data.cell_rhs(i) += (fe_values.shape_value(i, q_index)*old_solution_values[q_index] +
+                                    dt*old_solution_values[q_index]*scalar_product(u, fe_values.shape_grad(i, q_index)))*
+                                   fe_values.JxW(q_index);
         }
       }
     };
 
-    const auto copier = [&](const MeshWorker::CopyData<1, 1, 1>& c) {
-      constraints.distribute_local_to_global(c.matrices[0],
-                                             c.vectors[0],
-                                             c.local_dof_indices[0],
-                                             system_matrix_host,
-                                             system_rhs_host);
+    const auto face_worker = [&](const Iterator&                    cell,
+                                 const unsigned int&                f,
+                                 const unsigned int&                sf,
+                                 const Iterator&                    ncell,
+                                 const unsigned int&                nf,
+                                 const unsigned int&                nsf,
+                                 MeshWorker::ScratchData<dim, dim>& scratch_data,
+                                 CopyData&                          copy_data) {
+      const FEInterfaceValues<dim>& fe_iv = scratch_data.reinit(cell, f, sf, ncell, nf, nsf);
+
+      const unsigned int n_q_points = fe_iv.n_quadrature_points;
+      std::vector<double> old_solution_average_values(n_q_points);
+      std::vector<double> old_solution_jump_values(n_q_points);
+
+      fe_iv.get_average_of_function_values(solution_host, old_solution_average_values);
+      fe_iv.get_jump_in_function_values(solution_host, old_solution_jump_values);
+
+      copy_data.face_data.emplace_back();
+      CopyDataFace& copy_data_face = copy_data.face_data.back();
+
+      const unsigned int n_dofs = fe_iv.n_current_interface_dofs();
+      copy_data_face.cell_rhs.reinit(n_dofs);
+
+      copy_data_face.joint_dof_indices = fe_iv.get_interface_dof_indices();
+
+      const auto& quadrature_points = fe_iv.get_quadrature_points();
+      const auto& normal_vectors    = fe_iv.get_normal_vectors();
+
+      for(unsigned int q_index = 0; q_index < n_q_points; ++q_index) {
+        const auto& n   = normal_vectors[q_index];
+
+        const auto& x_q = quadrature_points[q_index];
+        Tensor<1, dim> u;
+        for(unsigned int d = 0; d < dim; ++d) {
+          u[d] = velocity.value(x_q, d);
+        }
+
+        const auto& u_dot_n = scalar_product(u, n);
+        const auto& lambda  = std::abs(u_dot_n);
+
+        for(unsigned int i = 0; i < n_dofs; ++i) {
+          copy_data_face.cell_rhs(i) -= fe_iv.jump_in_shape_values(i, q_index)*
+                                        (dt*(u_dot_n*old_solution_average_values[q_index] + 0.5*lambda*old_solution_jump_values[q_index]))*
+                                        fe_iv.JxW(q_index);
+        }
+      }
     };
 
-    const QGauss<dim> quadrature_formula(2*fe_degree + 1);
-    const UpdateFlags& update_flags = update_values | update_gradients | update_quadrature_points | update_JxW_values;
+    const auto boundary_worker = [&](const Iterator&                    cell,
+                                     const unsigned int&                f,
+                                     MeshWorker::ScratchData<dim, dim>& scratch_data,
+                                     CopyData&                          copy_data) {};
 
-    MeshWorker::ScratchData<dim, dim> scratch_data(fe, quadrature_formula, update_flags);
-    MeshWorker::CopyData<1, 1, 1> copy_data(fe.n_dofs_per_cell());
+    const auto copier = [&](const CopyData& c) {
+      constraints.distribute_local_to_global(c.cell_matrix,
+                                             c.cell_rhs,
+                                             c.local_dof_indices,
+                                             system_matrix_host,
+                                             system_rhs_host);
+      for(auto& cdf : c.face_data) {
+        constraints.distribute_local_to_global(cdf.cell_rhs,
+                                               cdf.joint_dof_indices,
+                                               system_rhs_host);
+      }
+    };
+
+    const QGauss<dim> quadrature_formula_cell(2*fe_degree + 1);
+    const UpdateFlags& update_flags_cell = update_values | update_gradients | update_quadrature_points | update_JxW_values;
+
+    const QGauss<dim - 1> quadrature_formula_face(2*fe_degree + 1);
+    const UpdateFlags& update_flags_face = update_values | update_quadrature_points | update_normal_vectors | update_JxW_values;
+
+    MeshWorker::ScratchData<dim, dim> scratch_data(fe,
+                                                   quadrature_formula_cell, update_flags_cell,
+                                                   quadrature_formula_face, update_flags_face);
+    CopyData copy_data;
 
     MeshWorker::mesh_loop(dof_handler.begin_active(),
                           dof_handler.end(),
                           cell_worker,
                           copier,
                           scratch_data,
-                          copy_data);
+                          copy_data,
+                          MeshWorker::assemble_own_cells |
+                          MeshWorker::assemble_boundary_faces |
+                          MeshWorker::assemble_own_interior_faces_once,
+                          boundary_worker,
+                          face_worker);
 
     Utilities::CUDA::Handle cuda_handle;
     system_matrix_dev.reinit(cuda_handle, system_matrix_host);
