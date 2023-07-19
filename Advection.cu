@@ -9,7 +9,7 @@
 #include <deal.II/fe/fe_dgq.h>
 
 #include <deal.II/grid/grid_generator.h>
-#include <deal.II/grid/tria.h>
+#include <deal.II/distributed/tria.h>
 
 #include <deal.II/lac/affine_constraints.h>
 #include <deal.II/lac/la_parallel_vector.h>
@@ -79,7 +79,7 @@ namespace AdvectionSolver {
     const double T;   /*--- Final time auxiliary variable ----*/
     double       dt;  /*--- Time step auxiliary variable ---*/
 
-    Triangulation<dim> triangulation;
+    parallel::distributed::Triangulation<dim> triangulation;
 
     FE_DGQ<dim> fe;
 
@@ -126,6 +126,9 @@ namespace AdvectionSolver {
 
     void analyze_results();
 
+    IndexSet locally_owned_dofs;
+    IndexSet locally_relevant_dofs;
+
     AffineConstraints<double> constraints;
 
     unsigned int n_refines; /*--- Number of refinements auxiliary variable ---*/
@@ -157,7 +160,7 @@ namespace AdvectionSolver {
     t_0(data.initial_time),
     T(data.final_time),
     dt(data.dt),
-    triangulation(),
+    triangulation(MPI_COMM_WORLD),
     fe(fe_degree),
     dof_handler(triangulation),
     rho_init(data.initial_time),
@@ -166,9 +169,9 @@ namespace AdvectionSolver {
     max_its(data.max_iterations),
     eps(data.eps),
     saving_dir(data.dir),
-    pcout(std::cout),
+    pcout(std::cout, Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0),
     time_out("./" + data.dir + "/time_analysis_1proc.dat"),
-    ptime_out(time_out),
+    ptime_out(time_out, Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0),
     time_table(ptime_out, TimerOutput::summary, TimerOutput::cpu_and_wall_times),
     output_n_dofs_density("./" + data.dir + "/n_dofs_density.dat", std::ofstream::out),
     output_error_rho("./" + data.dir + "/error_analysis_rho.dat", std::ofstream::out) {
@@ -202,9 +205,15 @@ namespace AdvectionSolver {
 
     pcout << "dim (Q_h) = " << dof_handler.n_dofs() << std::endl
           << std::endl;
-    output_n_dofs_density << dof_handler.n_dofs() << std::endl;
+    if(Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0) {
+      output_n_dofs_density << dof_handler.n_dofs() << std::endl;
+    }
+
+    locally_owned_dofs = dof_handler.locally_owned_dofs();
+    DoFTools::extract_locally_relevant_dofs(dof_handler, locally_relevant_dofs);
 
     constraints.clear();
+    constraints.reinit(locally_relevant_dofs);
     DoFTools::make_periodicity_constraints(dof_handler, 0, 1, 0, constraints);
     DoFTools::make_periodicity_constraints(dof_handler, 2, 3, 1, constraints);
     constraints.close();
@@ -299,7 +308,9 @@ namespace AdvectionSolver {
   void AdvectionProblem<dim, fe_degree>::assemble_rhs() {
     TimerOutput::Scope t(time_table, "Assemble rhs");
 
-    Vector<double> system_rhs_host(dof_handler.n_dofs());
+    LinearAlgebra::distributed::Vector<double, MemorySpace::Host> system_rhs_host(locally_owned_dofs,
+                                                                                  locally_relevant_dofs,
+                                                                                  MPI_COMM_WORLD); /*--- Right hand-side vector ---*/
 
     using Iterator = typename DoFHandler<dim>::active_cell_iterator;
 
@@ -461,8 +472,8 @@ namespace AdvectionSolver {
     DataOutBase::VtkFlags flags;
     flags.compression_level = DataOutBase::VtkFlags::best_speed;
     data_out.set_flags(flags);
-    std::ofstream output_file("./" + saving_dir + "/solution_" + Utilities::int_to_string(step, 5) + ".vtu");
-    data_out.write_vtu(output_file);
+    std::string output_file = "./" + saving_dir + "/solution_" + Utilities::int_to_string(step, 5) + ".vtu";
+    data_out.write_vtu_in_parallel(output_file, MPI_COMM_WORLD);
   }
 
 
@@ -493,8 +504,10 @@ namespace AdvectionSolver {
     pcout << "Verification via L2 error:    "          << error_L2_rho     << std::endl;
     pcout << "Verification via L2 relative error:    " << error_rel_L2_rho << std::endl;
 
-    output_error_rho << error_L2_rho     << std::endl;
-    output_error_rho << error_rel_L2_rho << std::endl;
+    if(Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0) {
+      output_error_rho << error_L2_rho     << std::endl;
+      output_error_rho << error_rel_L2_rho << std::endl;
+    }
   }
 
 
@@ -565,13 +578,17 @@ int main(int argc, char *argv[]) {
     RunTimeParameters::Data_Storage data;
     data.read_data("parameter-file.prm");
 
-    deallog.depth_console(data.verbose ? 2 : 0);
+    Utilities::MPI::MPI_InitFinalize mpi_init(argc, argv, 1);
 
-    int         n_devices       = 0;
-    cudaError_t cuda_error_code = cudaGetDeviceCount(&n_devices);
+    int         n_devices        = 0;
+    cudaError_t cuda_error_code  = cudaGetDeviceCount(&n_devices);
     AssertCuda(cuda_error_code);
-    cuda_error_code = cudaSetDevice(0);
+    const unsigned int my_mpi_id = Utilities::MPI::this_mpi_process(MPI_COMM_WORLD);
+    const int device_id          = my_mpi_id % n_devices;
+    cuda_error_code              = cudaSetDevice(device_id);
     AssertCuda(cuda_error_code);
+
+    deallog.depth_console(data.verbose && my_mpi_id == 0 ? 2 : 0);
 
     AdvectionProblem<2, EquationData::degree> advection_problem(data);
     advection_problem.run(data.verbose, data.output_interval);
