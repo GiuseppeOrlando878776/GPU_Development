@@ -1,10 +1,12 @@
+/*--- Author: Giuseppe Orlando, 2023 ---*/
+
 #include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/quadrature_lib.h>
 #include <deal.II/base/timer.h>
 
 #include <deal.II/dofs/dof_tools.h>
 
-#include <deal.II/fe/fe_q.h>
+#include <deal.II/fe/fe_dgq.h>
 
 #include <deal.II/grid/grid_generator.h>
 #include <deal.II/grid/tria.h>
@@ -21,18 +23,47 @@
 #include <deal.II/base/cuda.h>
 
 #include <deal.II/lac/cuda_sparse_matrix.h>
-#include <deal.II/lac/dynamic_sparsity_pattern.h>
+#include <deal.II/lac/cuda_precondition.h>
 
 #include <fstream>
 
+#include <deal.II/meshworker/mesh_loop.h>
+#include <deal.II/meshworker/scratch_data.h>
+#include <deal.II/meshworker/copy_data.h>
+
+#include <deal.II/fe/fe_interface_values.h>
+
 #include "runtime_parameters.h"
 #include "equation_data.h"
-
 
 // As usual, we enclose everything into a namespace of its own:
 //
 namespace AdvectionSolver {
   using namespace dealii;
+
+  /*--- Auxiliry structs to coyp data from local to global in a DG framework ---*/
+  struct CopyDataFace {
+    Vector<double>                       cell_rhs;
+    std::vector<types::global_dof_index> joint_dof_indices;
+  };
+
+
+  struct CopyData {
+    FullMatrix<double>                   cell_matrix;
+    Vector<double>                       cell_rhs;
+    std::vector<types::global_dof_index> local_dof_indices;
+    std::vector<CopyDataFace>            face_data;
+
+    template<class Iterator>
+    void reinit(const Iterator& cell, unsigned int dofs_per_cell) {
+      cell_matrix.reinit(dofs_per_cell, dofs_per_cell);
+      cell_rhs.reinit(dofs_per_cell);
+
+      local_dof_indices.resize(dofs_per_cell);
+      cell->get_dof_indices(local_dof_indices);
+    }
+  };
+
 
   // @sect{Class <code>AdvectionProblem</code>}
 
@@ -48,34 +79,25 @@ namespace AdvectionSolver {
     const double T;   /*--- Final time auxiliary variable ----*/
     double       dt;  /*--- Time step auxiliary variable ---*/
 
-    Triangulation<dim> triangulation; /*--- The variable which stores the mesh ---*/
+    Triangulation<dim> triangulation;
 
-    FE_Q<dim>       fe; /*--- Finite element space ---*/
+    FE_DGQ<dim> fe;
 
-    DoFHandler<dim> dof_handler; /*--- Degrees of freedom handler ---*/
+    DoFHandler<dim> dof_handler;
 
     // Since all the operations in the `solve()` function are executed on the
     // graphics card, it is necessary for the vectors used to store their values
-    // on the GPU as well. LinearAlgebra::distributed::Vector can be told which
-    // memory space to use. There is also LinearAlgebra::CUDAWrappers::Vector
-    // that always uses GPU memory storage but doesn't work with MPI. It might
-    // be worth noticing that the communication between different MPI processes
-    // can be improved if the MPI implementation is CUDA-aware and the configure
-    // flag `DEAL_II_MPI_WITH_CUDA_SUPPORT` is enabled. (The value of this
-    // flag needs to be set at the time you call `cmake` when installing
-    // deal.II.)
-    //
-    // In addition, we also keep a solution vector with CPU storage such that we
-    // can view and display the solution as usual.
+    // on the GPU as well. In addition, we also keep a solution vector with
+    // CPU storage such that we can view and display the solution as usual.
     CUDAWrappers::SparseMatrix<double> system_matrix_dev;
     SparsityPattern sparsity_pattern;
 
     LinearAlgebra::CUDAWrappers::Vector<double> solution_dev;
     LinearAlgebra::CUDAWrappers::Vector<double> system_rhs_dev;
 
-    LinearAlgebra::distributed::Vector<double, MemorySpace::Host> solution_host;
-    LinearAlgebra::distributed::Vector<double, MemorySpace::Host> solution_host_old;
-    LinearAlgebra::distributed::Vector<double, MemorySpace::Host> solution_host_tmp;
+    LinearAlgebra::distributed::Vector<double, MemorySpace::Host> solution_host,
+                                                                  solution_host_old,
+                                                                  solution_host_tmp;
 
   private:
     EquationData::Density<dim>  rho_init;
@@ -104,15 +126,14 @@ namespace AdvectionSolver {
 
     void analyze_results();
 
-    IndexSet locally_owned_dofs;
-    IndexSet locally_relevant_dofs;
-
     AffineConstraints<double> constraints;
+
+    unsigned int n_refines; /*--- Number of refinements auxiliary variable ---*/
 
     unsigned int max_its; /*--- Auxiliary variable for the maximum number of iterations of linear solvers ---*/
     double       eps;     /*--- Auxiliary variable for the tolerance of linear solvers ---*/
 
-    std::string saving_dir; /*--- Auxiliary variable for the directory to save the results ---*/
+    std::string  saving_dir;      /*--- Auxiliary variable for the directory to save the results ---*/
 
     /*--- Now we declare a bunch of variables for text output ---*/
     ConditionalOStream pcout;
@@ -141,19 +162,19 @@ namespace AdvectionSolver {
     dof_handler(triangulation),
     rho_init(data.initial_time),
     velocity(data.initial_time),
+    n_refines(data.n_global_refines),
     max_its(data.max_iterations),
     eps(data.eps),
     saving_dir(data.dir),
-    pcout(std::cout, Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0),
-    time_out("./" + data.dir + "/time_analysis_" +
-             Utilities::int_to_string(Utilities::MPI::n_mpi_processes(MPI_COMM_WORLD)) + "proc.dat"),
-    ptime_out(time_out, Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0),
+    pcout(std::cout),
+    time_out("./" + data.dir + "/time_analysis_1proc.dat"),
+    ptime_out(time_out),
     time_table(ptime_out, TimerOutput::summary, TimerOutput::cpu_and_wall_times),
     output_n_dofs_density("./" + data.dir + "/n_dofs_density.dat", std::ofstream::out),
     output_error_rho("./" + data.dir + "/error_analysis_rho.dat", std::ofstream::out) {
       AssertThrow(!((dt <= 0.0) || (dt > 0.5*T)), ExcInvalidTimeStep(dt, 0.5*T));
 
-      create_triangulation(data.n_global_refines);
+      create_triangulation(n_refines);
       setup_system();
       initialize();
     }
@@ -179,26 +200,25 @@ namespace AdvectionSolver {
 
     dof_handler.distribute_dofs(fe);
 
-    locally_owned_dofs = dof_handler.locally_owned_dofs();
-    DoFTools::extract_locally_relevant_dofs(dof_handler, locally_relevant_dofs);
+    pcout << "dim (Q_h) = " << dof_handler.n_dofs() << std::endl
+          << std::endl;
+    output_n_dofs_density << dof_handler.n_dofs() << std::endl;
 
     constraints.clear();
-    constraints.reinit(locally_relevant_dofs);
-    DoFTools::make_hanging_node_constraints(dof_handler, constraints);
     DoFTools::make_periodicity_constraints(dof_handler, 0, 1, 0, constraints);
     DoFTools::make_periodicity_constraints(dof_handler, 2, 3, 1, constraints);
     constraints.close();
 
     DynamicSparsityPattern dsp(dof_handler.n_dofs());
-    DoFTools::make_sparsity_pattern(dof_handler, dsp, constraints);
+    DoFTools::make_flux_sparsity_pattern(dof_handler, dsp, constraints);
     sparsity_pattern.copy_from(dsp);
 
     solution_dev.reinit(dof_handler.n_dofs());
     system_rhs_dev.reinit(dof_handler.n_dofs());
 
-    solution_host.reinit(locally_owned_dofs, locally_relevant_dofs, MPI_COMM_WORLD);
-    solution_host_old.reinit(locally_owned_dofs, locally_relevant_dofs, MPI_COMM_WORLD);
-    solution_host_tmp.reinit(locally_owned_dofs, locally_relevant_dofs, MPI_COMM_WORLD);
+    solution_host.reinit(dof_handler.n_dofs());
+    solution_host_old.reinit(solution_host);
+    solution_host_tmp.reinit(solution_host);
   }
 
 
@@ -207,9 +227,9 @@ namespace AdvectionSolver {
   void AdvectionProblem<dim, fe_degree>::initialize() {
     TimerOutput::Scope t(time_table, "Initialize state");
 
-    VectorTools::interpolate(dof_handler, rho_init, solution_host);
+    VectorTools::interpolate(MappingQ1<dim>(), dof_handler, rho_init, solution_host);
 
-    LinearAlgebra::ReadWriteVector<double> rw_vector(locally_owned_dofs);
+    LinearAlgebra::ReadWriteVector<double> rw_vector(dof_handler.n_dofs());
     rw_vector.import(solution_host, VectorOperation::insert);
     solution_dev.import(rw_vector, VectorOperation::insert);
   }
@@ -219,43 +239,55 @@ namespace AdvectionSolver {
   //
   template <int dim, int fe_degree>
   void AdvectionProblem<dim, fe_degree>::assemble_matrix() {
+    TimerOutput::Scope t(time_table, "Assemble matrix");
+
     SparseMatrix<double> system_matrix_host;
     system_matrix_host.reinit(sparsity_pattern);
 
-    const QGauss<dim> quadrature_formula(fe_degree + 1);
+    using Iterator = typename DoFHandler<dim>::active_cell_iterator;
 
-    FEValues<dim> fe_values(fe, quadrature_formula,
-                            update_values | update_gradients | update_quadrature_points | update_JxW_values);
+    /*--- Compute cellwise contribution ---*/
+    const auto cell_worker = [&](const Iterator&                    cell,
+                                 MeshWorker::ScratchData<dim, dim>& scratch_data,
+                                 CopyData&                          copy_data) {
+      const FEValues<dim>& fe_values = scratch_data.reinit(cell);
 
-    const unsigned int dofs_per_cell = fe.n_dofs_per_cell();
-    const unsigned int n_q_points    = quadrature_formula.size();
+      const unsigned int dofs_per_cell = fe_values.get_fe().n_dofs_per_cell();
+      copy_data.reinit(cell, dofs_per_cell);
 
-    FullMatrix<double> cell_matrix(dofs_per_cell, dofs_per_cell);
-
-    std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
-
-    for(const auto& cell : dof_handler.active_cell_iterators()) {
-      cell_matrix = 0;
-
-      fe_values.reinit(cell);
-
-      for(unsigned int q_index = 0; q_index < n_q_points; ++q_index) {
+      for(unsigned int q_index = 0; q_index < fe_values.n_quadrature_points; ++q_index) {
         for(unsigned int i = 0; i < dofs_per_cell; ++i) {
           for(unsigned int j = 0; j < dofs_per_cell; ++j) {
-            cell_matrix(i,j) += fe_values.shape_value(i, q_index)*
-                                (fe_values.shape_value(j, q_index))*
-                                fe_values.JxW(q_index);
+            copy_data.cell_matrix(i, j) += fe_values.shape_value(i, q_index)*
+                                           (fe_values.shape_value(j, q_index))*
+                                           fe_values.JxW(q_index);
           }
         }
       }
+    };
 
-      cell->get_dof_indices(local_dof_indices);
-
-      constraints.distribute_local_to_global(cell_matrix,
-                                             local_dof_indices,
+    /*--- Auxiliary lambda function to copy data from local to global ---*/
+    const auto copier = [&](const CopyData& c) {
+      constraints.distribute_local_to_global(c.cell_matrix,
+                                             c.local_dof_indices,
                                              system_matrix_host);
-    }
-    system_matrix_host.compress(VectorOperation::add);
+    };
+
+    /*--- Create the needed auxiliary structues (i.e. quadrature formula, scratch data and copy data) ---*/
+    const QGauss<dim> quadrature_formula_cell(fe_degree + 1);
+    MeshWorker::ScratchData<dim, dim> scratch_data(fe,
+                                                   quadrature_formula_cell,
+                                                   update_values | update_quadrature_points | update_JxW_values);
+    CopyData copy_data;
+
+    /*--- Perform the loop that effectively builds the matrix ---*/
+    MeshWorker::mesh_loop(dof_handler.begin_active(),
+                          dof_handler.end(),
+                          cell_worker,
+                          copier,
+                          scratch_data,
+                          copy_data,
+                          MeshWorker::assemble_own_cells);
 
     system_matrix_dev.reinit(cuda_handle, system_matrix_host);
   }
@@ -265,32 +297,24 @@ namespace AdvectionSolver {
   //
   template <int dim, int fe_degree>
   void AdvectionProblem<dim, fe_degree>::assemble_rhs() {
-    LinearAlgebra::distributed::Vector<double, MemorySpace::Host> system_rhs_host(locally_owned_dofs,
-                                                                                  locally_relevant_dofs,
-                                                                                  MPI_COMM_WORLD); /*--- Right hand-side vector ---*/
+    TimerOutput::Scope t(time_table, "Assemble rhs");
 
-    const QGauss<dim> quadrature_formula(fe_degree + 1);
+    Vector<double> system_rhs_host(dof_handler.n_dofs());
 
-    FEValues<dim> fe_values(fe, quadrature_formula,
-                            update_values | update_gradients | update_quadrature_points | update_JxW_values);
+    using Iterator = typename DoFHandler<dim>::active_cell_iterator;
 
-    const unsigned int dofs_per_cell = fe.n_dofs_per_cell();
-    const unsigned int n_q_points    = quadrature_formula.size();
+    /*--- Compute cellwise contribution ---*/
+    const auto cell_worker = [&](const Iterator&                    cell,
+                                 MeshWorker::ScratchData<dim, dim>& scratch_data,
+                                 CopyData&                          copy_data) {
+      const FEValues<dim>& fe_values = scratch_data.reinit(cell);
 
-    Vector<double> cell_rhs(dofs_per_cell);
+      const unsigned int dofs_per_cell = fe_values.get_fe().n_dofs_per_cell();
+      copy_data.reinit(cell, dofs_per_cell);
 
-    std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
-
-    std::vector<double> old_solution_values(n_q_points);
-    std::vector<Tensor<1, dim>> old_solution_gradients(n_q_points);
-
-    for(const auto& cell : dof_handler.active_cell_iterators()) {
-      cell_rhs = 0;
-
-      fe_values.reinit(cell);
-
+      const unsigned int n_q_points = fe_values.n_quadrature_points;
+      std::vector<double> old_solution_values(n_q_points);
       fe_values.get_function_values(solution_host, old_solution_values);
-      fe_values.get_function_gradients(solution_host, old_solution_gradients);
 
       for(unsigned int q_index = 0; q_index < n_q_points; ++q_index) {
         const auto& x_q = fe_values.quadrature_point(q_index);
@@ -300,21 +324,102 @@ namespace AdvectionSolver {
         }
 
         for(unsigned int i = 0; i < dofs_per_cell; ++i) {
-          cell_rhs(i) += fe_values.shape_value(i, q_index)*
-                         (old_solution_values[q_index] - dt*scalar_product(u, old_solution_gradients[q_index]))*
-                         fe_values.JxW(q_index);
+          copy_data.cell_rhs(i) += (fe_values.shape_value(i, q_index)*old_solution_values[q_index] +
+                                    dt*old_solution_values[q_index]*scalar_product(u, fe_values.shape_grad(i, q_index)))*
+                                   fe_values.JxW(q_index);
         }
       }
+    };
 
-      cell->get_dof_indices(local_dof_indices);
+    /*--- Compute single inner face contribution ---*/
+    const auto face_worker = [&](const Iterator&                    cell,
+                                 const unsigned int&                f,
+                                 const unsigned int&                sf,
+                                 const Iterator&                    ncell,
+                                 const unsigned int&                nf,
+                                 const unsigned int&                nsf,
+                                 MeshWorker::ScratchData<dim, dim>& scratch_data,
+                                 CopyData&                          copy_data) {
+      const FEInterfaceValues<dim>& fe_iv = scratch_data.reinit(cell, f, sf, ncell, nf, nsf);
 
-      constraints.distribute_local_to_global(cell_rhs,
-                                             local_dof_indices,
+      copy_data.face_data.emplace_back();
+      CopyDataFace& copy_data_face     = copy_data.face_data.back();
+      copy_data_face.joint_dof_indices = fe_iv.get_interface_dof_indices();
+
+      const unsigned int n_q_points = fe_iv.n_quadrature_points;
+      std::vector<double> old_solution_average_values(n_q_points);
+      std::vector<double> old_solution_jump_values(n_q_points);
+      fe_iv.get_average_of_function_values(solution_host, old_solution_average_values);
+      fe_iv.get_jump_in_function_values(solution_host, old_solution_jump_values);
+
+      const auto& quadrature_points = fe_iv.get_quadrature_points();
+      const auto& normal_vectors    = fe_iv.get_normal_vectors();
+
+      const unsigned int n_dofs = fe_iv.n_current_interface_dofs();
+      copy_data_face.cell_rhs.reinit(n_dofs);
+
+      for(unsigned int q_index = 0; q_index < n_q_points; ++q_index) {
+        const auto& n   = normal_vectors[q_index];
+
+        const auto& x_q = quadrature_points[q_index];
+        Tensor<1, dim> u;
+        for(unsigned int d = 0; d < dim; ++d) {
+          u[d] = velocity.value(x_q, d);
+        }
+
+        const auto& u_dot_n = scalar_product(u, n);
+        const auto& lambda  = std::abs(u_dot_n);
+
+        for(unsigned int i = 0; i < n_dofs; ++i) {
+          copy_data_face.cell_rhs(i) -= fe_iv.jump_in_shape_values(i, q_index)*
+                                        (dt*(u_dot_n*old_solution_average_values[q_index] + 0.5*lambda*old_solution_jump_values[q_index]))*
+                                        fe_iv.JxW(q_index);
+        }
+      }
+    };
+
+    /*--- Compute single boundary face contribution ---*/
+    const auto boundary_worker = [&](const Iterator&                    cell,
+                                     const unsigned int&                f,
+                                     MeshWorker::ScratchData<dim, dim>& scratch_data,
+                                     CopyData&                          copy_data) {};
+
+    /*--- Auxiliary lambda function to copy data from local to global ---*/
+    const auto copier = [&](const CopyData& c) {
+      constraints.distribute_local_to_global(c.cell_rhs,
+                                             c.local_dof_indices,
                                              system_rhs_host);
-    }
-    system_rhs_host.compress(VectorOperation::add);
+      for(auto& cdf : c.face_data) {
+        constraints.distribute_local_to_global(cdf.cell_rhs,
+                                               cdf.joint_dof_indices,
+                                               system_rhs_host);
+      }
+    };
 
-    LinearAlgebra::ReadWriteVector<double> rw_vector(locally_owned_dofs);
+    /*--- Create the needed auxiliary structues (i.e. quadrature formulas, scratch data and copy data) ---*/
+    const QGauss<dim> quadrature_formula_cell(fe_degree + 1);
+    const QGauss<dim - 1> quadrature_formula_face(fe_degree + 1);
+    MeshWorker::ScratchData<dim, dim> scratch_data(fe,
+                                                   quadrature_formula_cell,
+                                                   update_values | update_gradients | update_quadrature_points | update_JxW_values,
+                                                   quadrature_formula_face,
+                                                   update_values | update_quadrature_points | update_normal_vectors | update_JxW_values);
+    CopyData copy_data;
+
+    /*--- Perform the loop that effectively builds the rhs ---*/
+    MeshWorker::mesh_loop(dof_handler.begin_active(),
+                          dof_handler.end(),
+                          cell_worker,
+                          copier,
+                          scratch_data,
+                          copy_data,
+                          MeshWorker::assemble_own_cells |
+                          MeshWorker::assemble_boundary_faces |
+                          MeshWorker::assemble_own_interior_faces_once,
+                          boundary_worker,
+                          face_worker);
+
+    LinearAlgebra::ReadWriteVector<double> rw_vector(dof_handler.n_dofs());
     rw_vector.import(system_rhs_host, VectorOperation::insert);
     system_rhs_dev.import(rw_vector, VectorOperation::insert);
   }
@@ -332,7 +437,7 @@ namespace AdvectionSolver {
     SolverCG<LinearAlgebra::CUDAWrappers::Vector<double>> cg(solver_control);
     cg.solve(system_matrix_dev, solution_dev, system_rhs_dev, preconditioner);
 
-    LinearAlgebra::ReadWriteVector<double> rw_vector(locally_owned_dofs);
+    LinearAlgebra::ReadWriteVector<double> rw_vector(dof_handler.n_dofs());
     rw_vector.import(solution_dev, VectorOperation::insert);
     solution_host.import(rw_vector, VectorOperation::insert);
 
@@ -349,18 +454,15 @@ namespace AdvectionSolver {
 
     DataOut<dim> data_out;
 
-    data_out.attach_dof_handler(dof_handler);
-
     solution_host.update_ghost_values();
-    data_out.add_data_vector(solution_host, "solution");
-
-    data_out.build_patches();
+    data_out.add_data_vector(dof_handler, solution_host, "solution");
+    data_out.build_patches(MappingQ1<dim>());
 
     DataOutBase::VtkFlags flags;
     flags.compression_level = DataOutBase::VtkFlags::best_speed;
     data_out.set_flags(flags);
-    std::string output_file = "./" + saving_dir + "/solution_" + Utilities::int_to_string(step, 5) + ".vtu";
-    data_out.write_vtu_in_parallel(output_file, MPI_COMM_WORLD);
+    std::ofstream output_file("./" + saving_dir + "/solution_" + Utilities::int_to_string(step, 5) + ".vtu");
+    data_out.write_vtu(output_file);
   }
 
 
@@ -391,10 +493,8 @@ namespace AdvectionSolver {
     pcout << "Verification via L2 error:    "          << error_L2_rho     << std::endl;
     pcout << "Verification via L2 relative error:    " << error_rel_L2_rho << std::endl;
 
-    if(Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0) {
-      output_error_rho << error_L2_rho     << std::endl;
-      output_error_rho << error_rel_L2_rho << std::endl;
-    }
+    output_error_rho << error_L2_rho     << std::endl;
+    output_error_rho << error_rel_L2_rho << std::endl;
   }
 
 
@@ -403,7 +503,7 @@ namespace AdvectionSolver {
   //
   template <int dim, int fe_degree>
   void AdvectionProblem<dim, fe_degree>::run(const bool verbose, const unsigned int output_interval) {
-    ConditionalOStream verbose_cout(std::cout, verbose && Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0);
+    ConditionalOStream verbose_cout(std::cout, verbose);
 
     analyze_results();
     output_results(0);
@@ -434,7 +534,6 @@ namespace AdvectionSolver {
       solution_host.add(1.0/3.0, solution_host_old);
 
       if(n % output_interval == 0) {
-        verbose_cout << "Plotting Solution final" << std::endl;
         output_results(n);
       }
       if(T - time < dt && T - time > 1e-10) {
@@ -448,6 +547,7 @@ namespace AdvectionSolver {
       output_results(n);
     }
   }
+
 } // namespace AdvectionSolver
 
 
@@ -465,17 +565,13 @@ int main(int argc, char *argv[]) {
     RunTimeParameters::Data_Storage data;
     data.read_data("parameter-file.prm");
 
-    Utilities::MPI::MPI_InitFinalize mpi_init(argc, argv, 1);
+    deallog.depth_console(data.verbose ? 2 : 0);
 
     int         n_devices       = 0;
     cudaError_t cuda_error_code = cudaGetDeviceCount(&n_devices);
     AssertCuda(cuda_error_code);
-    const unsigned int my_mpi_id = Utilities::MPI::this_mpi_process(MPI_COMM_WORLD);
-    const int device_id = my_mpi_id % n_devices;
-    cuda_error_code     = cudaSetDevice(device_id);
+    cuda_error_code = cudaSetDevice(0);
     AssertCuda(cuda_error_code);
-
-    deallog.depth_console(data.verbose && my_mpi_id == 0 ? 2 : 0);
 
     AdvectionProblem<2, EquationData::degree> advection_problem(data);
     advection_problem.run(data.verbose, data.output_interval);
