@@ -49,9 +49,14 @@ namespace AdvectionSolver {
   template <int dim, int fe_degree, int n_q_points_1d>
   class AdvectionOperatorQuad {
   public:
-    __device__ AdvectionOperatorQuad() {}
+    DEAL_II_HOST_DEVICE AdvectionOperatorQuad(const typename CUDAWrappers::MatrixFree<dim, double>::Data* gpu_data_) :
+      gpu_data(gpu_data_) {}
 
-    __device__ void operator()(CUDAWrappers::FEEvaluation<dim, fe_degree, n_q_points_1d, 1, double>* fe_eval) const;
+    DEAL_II_HOST_DEVICE void operator()(CUDAWrappers::FEEvaluation<dim, fe_degree, n_q_points_1d, 1, double>* fe_eval,
+                                        const int q_point) const;
+
+  private:
+    const typename CUDAWrappers::MatrixFree<dim, double>::Data* gpu_data;
   };
 
 
@@ -59,9 +64,10 @@ namespace AdvectionSolver {
   // assemble a mass matrix.
   //
   template <int dim, int fe_degree, int n_q_points_1d>
-  __device__ void AdvectionOperatorQuad<dim, fe_degree, n_q_points_1d>::
-  operator()(CUDAWrappers::FEEvaluation<dim, fe_degree, n_q_points_1d, 1, double>* fe_eval) const {
-    fe_eval->submit_value(fe_eval->get_value());
+  DEAL_II_HOST_DEVICE void AdvectionOperatorQuad<dim, fe_degree, n_q_points_1d>::
+  operator()(CUDAWrappers::FEEvaluation<dim, fe_degree, n_q_points_1d, 1, double>* fe_eval,
+             const int q_point) const {
+    fe_eval->submit_value(fe_eval->get_value(q_point), q_point);
   }
 
 
@@ -76,11 +82,11 @@ namespace AdvectionSolver {
   public:
     LocalAdvectionOperator() {}
 
-    __device__ void operator()(const unsigned int                                          cell,
-                               const typename CUDAWrappers::MatrixFree<dim, double>::Data* gpu_data,
-                               CUDAWrappers::SharedData<dim, double>*                      shared_data,
-                               const double*                                               src,
-                               double*                                                     dst) const;
+    DEAL_II_HOST_DEVICE void operator()(const unsigned int                                          cell,
+                                        const typename CUDAWrappers::MatrixFree<dim, double>::Data* gpu_data,
+                                        CUDAWrappers::SharedData<dim, double>*                      shared_data,
+                                        const double*                                               src,
+                                        double*                                                     dst) const;
 
     // The CUDAWrappers::MatrixFree object doesn't know about the number
     // of degrees of freedom and the number of quadrature points so we need
@@ -97,18 +103,18 @@ namespace AdvectionSolver {
   // value information to the destination vector.
   //
   template <int dim, int fe_degree, int n_q_points_1d>
-  __device__ void LocalAdvectionOperator<dim, fe_degree, n_q_points_1d>::
+  DEAL_II_HOST_DEVICE void LocalAdvectionOperator<dim, fe_degree, n_q_points_1d>::
   operator()(const unsigned int                                          cell,
              const typename CUDAWrappers::MatrixFree<dim, double>::Data* gpu_data,
              CUDAWrappers::SharedData<dim, double>*                      shared_data,
              const double*                                               src,
              double*                                                     dst) const {
-    CUDAWrappers::FEEvaluation<dim, fe_degree, n_q_points_1d, 1, double> fe_eval(cell, gpu_data, shared_data);
+    CUDAWrappers::FEEvaluation<dim, fe_degree, n_q_points_1d, 1, double> fe_eval(gpu_data, shared_data);
 
     fe_eval.read_dof_values(src);
     fe_eval.evaluate(true, false); /*--- This two-stage procedure is necessary because gather_evaluate has not been defined ---*/
 
-    fe_eval.apply_for_each_quad_point(AdvectionOperatorQuad<dim, fe_degree, n_q_points_1d>());
+    fe_eval.apply_for_each_quad_point(AdvectionOperatorQuad<dim, fe_degree, n_q_points_1d>(gpu_data));
 
     fe_eval.integrate(true, false);
     fe_eval.distribute_local_to_global(dst); /*--- This two-stage procedure is necessary because integrate_scatter has not been defined ---*/
@@ -130,10 +136,10 @@ namespace AdvectionSolver {
     AdvectionOperator(const DoFHandler<dim>&           dof_handler,
                       const AffineConstraints<double>& constraints);
 
-    void initialize_dof_vector(LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>& vec) const;
+    void initialize_dof_vector(LinearAlgebra::distributed::Vector<double, MemorySpace::Default>& vec) const;
 
-    void vmult(LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>&       dst,
-               const LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>& src) const;
+    void vmult(LinearAlgebra::distributed::Vector<double, MemorySpace::Default>&       dst,
+               const LinearAlgebra::distributed::Vector<double, MemorySpace::Default>& src) const;
 
   private:
     CUDAWrappers::MatrixFree<dim, double> mf_data; /*--- Notice that this class cannot be derived from MatrixFreeOperators::Base
@@ -151,7 +157,7 @@ namespace AdvectionSolver {
   AdvectionOperator(const DoFHandler<dim>&           dof_handler,
                     const AffineConstraints<double>& constraints) {
     typename CUDAWrappers::MatrixFree<dim, double>::AdditionalData additional_data; /*--- Additional data with flags to be initialized ---*/
-    additional_data.mapping_update_flags = update_values | update_JxW_values | update_quadrature_points;
+    additional_data.mapping_update_flags = update_values | update_gradients | update_JxW_values | update_quadrature_points;
 
     const QGauss<1> quad(n_q_points_1d); /*--- Quadrature formula ---*/
 
@@ -164,7 +170,7 @@ namespace AdvectionSolver {
   //
   template <int dim, int fe_degree, int n_q_points_1d>
   void AdvectionOperator<dim, fe_degree, n_q_points_1d>::
-  initialize_dof_vector(LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>& vec) const {
+  initialize_dof_vector(LinearAlgebra::distributed::Vector<double, MemorySpace::Default>& vec) const {
     mf_data.initialize_dof_vector(vec);
   }
 
@@ -180,13 +186,13 @@ namespace AdvectionSolver {
   //
   template <int dim, int fe_degree, int n_q_points_1d>
   void AdvectionOperator<dim, fe_degree, n_q_points_1d>::
-  vmult(LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>&       dst,
-        const LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>& src) const {
+  vmult(LinearAlgebra::distributed::Vector<double, MemorySpace::Default>&       dst,
+        const LinearAlgebra::distributed::Vector<double, MemorySpace::Default>& src) const {
     dst = 0;
 
     LocalAdvectionOperator<dim, fe_degree, n_q_points_1d> local_advection_operator;
     mf_data.cell_loop(local_advection_operator, src, dst);
-    /*--- The cell_loop needs as first input argument a Functor with a __device__ void operator().
+    /*--- The cell_loop needs as first input argument a Functor with a DEAL_II_HOST_DEVICE void operator().
           Hence, we need a class for the local action and a simple routine seems not to be sufficient because of the operator() request. ---*/
 
     mf_data.copy_constrained_values(src, dst);
@@ -231,8 +237,8 @@ namespace AdvectionSolver {
     //
     // In addition, we also keep a solution vector with CPU storage such that we
     // can view and display the solution as usual.
-    LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA> solution_dev;
-    LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA> system_rhs_dev;
+    LinearAlgebra::distributed::Vector<double, MemorySpace::Default> solution_dev;
+    LinearAlgebra::distributed::Vector<double, MemorySpace::Default> system_rhs_dev;
 
     LinearAlgebra::distributed::Vector<double, MemorySpace::Host> solution_host;
     LinearAlgebra::distributed::Vector<double, MemorySpace::Host> solution_host_old;
@@ -321,7 +327,7 @@ namespace AdvectionSolver {
   void AdvectionProblem<dim, fe_degree>::create_triangulation(const unsigned int n_refines) {
     TimerOutput::Scope t(time_table, "Create triangulation");
 
-    GridGenerator::subdivided_hyper_cube(triangulation, 15, -0.5, 0.5, false);
+    GridGenerator::subdivided_hyper_cube(triangulation, 15, -0.5, 0.5, true);
 
     triangulation.refine_global(n_refines);
   }
@@ -335,12 +341,14 @@ namespace AdvectionSolver {
 
     dof_handler.distribute_dofs(fe);
 
+    pcout << "dim (Q_h) = " << dof_handler.n_dofs() << std::endl
+          << std::endl;
+    output_n_dofs_density << dof_handler.n_dofs() << std::endl;
+
     constraints.clear();
     DoFTools::make_hanging_node_constraints(dof_handler, constraints);
-    VectorTools::interpolate_boundary_values(dof_handler,
-                                             0,
-                                             Functions::ZeroFunction<dim>(),
-                                             constraints);
+    DoFTools::make_periodicity_constraints(dof_handler, 0, 1, 0, constraints);
+    DoFTools::make_periodicity_constraints(dof_handler, 2, 3, 1, constraints);
     constraints.close();
 
     solution_host.reinit(dof_handler.n_dofs());
@@ -448,7 +456,7 @@ namespace AdvectionSolver {
     PreconditionIdentity preconditioner;
 
     SolverControl solver_control(max_its, eps*system_rhs_dev.l2_norm());
-    SolverCG<LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>> cg(solver_control);
+    SolverCG<LinearAlgebra::distributed::Vector<double, MemorySpace::Default>> cg(solver_control);
     cg.solve(*system_matrix_dev, solution_dev, system_rhs_dev, preconditioner);
 
     LinearAlgebra::ReadWriteVector<double> rw_vector(dof_handler.n_dofs());
@@ -456,6 +464,9 @@ namespace AdvectionSolver {
     solution_host.import(rw_vector, VectorOperation::insert);
 
     constraints.distribute(solution_host);
+
+    rw_vector.import(solution_host, VectorOperation::insert);
+    solution_dev.import(rw_vector, VectorOperation::insert);
   }
 
   // The output results function is as usual since we have already copied the
@@ -592,9 +603,6 @@ int main() {
   try
   {
     using namespace AdvectionSolver;
-
-    cudaError_t cuda_error_code = cudaSetDevice(0);
-    AssertCuda(cuda_error_code);
 
     RunTimeParameters::Data_Storage data;
     data.read_data("parameter-file.prm");

@@ -3,8 +3,7 @@
 ##
 
 # Set the name of the project and target:
-#SET(TARGET "Advection")
-SET(TARGET "step-64")
+SET(TARGET "Advection")
 
 # Declare all source files the target consists of. Here, this is only
 # the one step-X.cc file, but as you expand your project you may wish
@@ -16,11 +15,8 @@ SET(TARGET "step-64")
 # or switch altogether to the large project CMakeLists.txt file discussed
 # in the "CMake in user projects" page accessible from the "User info"
 # page of the documentation.
-#SET(TARGET_SRC
-#  ${TARGET}.cc
-#  )
 SET(TARGET_SRC
-  ${TARGET}.cu
+  ${TARGET}.cc
   )
 
 # Usually, you will not need to modify anything beyond this point...
@@ -41,16 +37,14 @@ ENDIF()
 #
 # Are all dependencies fulfilled?
 #
-IF(NOT DEAL_II_WITH_MPI OR NOT DEAL_II_WITH_P4EST OR NOT DEAL_II_WITH_CUDA) # keep in one line
+IF(NOT DEAL_II_WITH_MPI OR NOT DEAL_II_WITH_P4EST) # keep in one line
   MESSAGE(FATAL_ERROR "
 Error! This tutorial requires a deal.II library that was configured with the following options:
     DEAL_II_WITH_MPI = ON
     DEAL_II_WITH_P4EST = ON
-    DEAL_II_WITH_CUDA = ON
 However, the deal.II library found at ${DEAL_II_PATH} was configured with these options
     DEAL_II_WITH_MPI = ${DEAL_II_WITH_MPI}
     DEAL_II_WITH_P4EST = ${DEAL_II_WITH_P4EST}
-    DEAL_II_WITH_CUDA = ${DEAL_II_WITH_CUDA}
 which conflict with the requirements."
     )
 ENDIF()

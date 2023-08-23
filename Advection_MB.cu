@@ -1,5 +1,3 @@
-/*--- Author: Giuseppe Orlando, 2023 ---*/
-
 #include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/quadrature_lib.h>
 #include <deal.II/base/timer.h>
@@ -9,7 +7,6 @@
 #include <deal.II/fe/fe_q.h>
 
 #include <deal.II/grid/grid_generator.h>
-#include <deal.II/grid/grid_tools.h>
 #include <deal.II/grid/tria.h>
 
 #include <deal.II/lac/affine_constraints.h>
@@ -19,14 +16,14 @@
 
 #include <deal.II/numerics/data_out.h>
 #include <deal.II/numerics/vector_tools.h>
+#include <deal.II/numerics/matrix_tools.h>
 
 // The following ones include the data structures for the
-// implementation of matrix-free methods on GPU:
+// implementation of matrix-based methods on GPU:
 #include <deal.II/base/cuda.h>
 
-#include <deal.II/matrix_free/cuda_fe_evaluation.h>
-#include <deal.II/matrix_free/cuda_matrix_free.h>
-#include <deal.II/matrix_free/operators.h>
+#include <deal.II/lac/cuda_sparse_matrix.h>
+#include <deal.II/lac/dynamic_sparsity_pattern.h>
 
 // Include some other fundamental headers
 #include <fstream>
@@ -34,172 +31,14 @@
 #include "runtime_parameters.h"
 #include "equation_data.h"
 
+
 // As usual, we enclose everything into a namespace of its own:
 //
 namespace AdvectionSolver {
   using namespace dealii;
 
-  // @sect{Class <code>AdvectionOperatorQuad</code>}
-
-  // The class `AdvectionOperatorQuad` implements the evaluation of
-  // the mass matrix at each quadrature point. The functions of this class
-  // need to run on the device, so need to be marked as `__device__` for the
-  // compiler.
-  //
-  template <int dim, int fe_degree, int n_q_points_1d>
-  class AdvectionOperatorQuad {
-  public:
-    __device__ AdvectionOperatorQuad() {}
-
-    __device__ void operator()(CUDAWrappers::FEEvaluation<dim, fe_degree, n_q_points_1d, 1, double>* fe_eval) const;
-  };
-
-
-  // Since we are using an explicit time integration scheme, we just need to
-  // assemble a mass matrix.
-  //
-  template <int dim, int fe_degree, int n_q_points_1d>
-  __device__ void AdvectionOperatorQuad<dim, fe_degree, n_q_points_1d>::
-  operator()(CUDAWrappers::FEEvaluation<dim, fe_degree, n_q_points_1d, 1, double>* fe_eval) const {
-    fe_eval->submit_value(fe_eval->get_value());
-  }
-
-
-  // @sect{Class <code>LocalAdvectionOperator</code>}
-
-  // Finally, we need to define a class that implements the whole operator
-  // evaluation that corresponds to a matrix-vector product in matrix-based
-  // approaches.
-  //
-  template <int dim, int fe_degree, int n_q_points_1d>
-  class LocalAdvectionOperator {
-  public:
-    LocalAdvectionOperator() {}
-
-    __device__ void operator()(const unsigned int                                          cell,
-                               const typename CUDAWrappers::MatrixFree<dim, double>::Data* gpu_data,
-                               CUDAWrappers::SharedData<dim, double>*                      shared_data,
-                               const double*                                               src,
-                               double*                                                     dst) const;
-
-    // The CUDAWrappers::MatrixFree object doesn't know about the number
-    // of degrees of freedom and the number of quadrature points so we need
-    // to store these for index calculations in the call operator.
-    static const unsigned int n_dofs_1d    = fe_degree + 1;
-    static const unsigned int n_local_dofs = dealii::Utilities::pow(n_dofs_1d, dim);
-    static const unsigned int n_q_points   = Utilities::pow(n_q_points_1d, dim);
-  };
-
-
-  // This is the call operator that performs the Advection operator evaluation
-  // on a given cell similar to the MatrixFree framework on the CPU.
-  // In particular, we need access values of the source vector and we write
-  // value information to the destination vector.
-  //
-  template <int dim, int fe_degree, int n_q_points_1d>
-  __device__ void LocalAdvectionOperator<dim, fe_degree, n_q_points_1d>::
-  operator()(const unsigned int                                          cell,
-             const typename CUDAWrappers::MatrixFree<dim, double>::Data* gpu_data,
-             CUDAWrappers::SharedData<dim, double>*                      shared_data,
-             const double*                                               src,
-             double*                                                     dst) const {
-    CUDAWrappers::FEEvaluation<dim, fe_degree, n_q_points_1d, 1, double> fe_eval(cell, gpu_data, shared_data);
-
-    fe_eval.read_dof_values(src);
-    fe_eval.evaluate(true, false); /*--- This two-stage procedure is necessary because gather_evaluate has not been defined ---*/
-
-    fe_eval.apply_for_each_quad_point(AdvectionOperatorQuad<dim, fe_degree, n_q_points_1d>());
-
-    fe_eval.integrate(true, false);
-    fe_eval.distribute_local_to_global(dst); /*--- This two-stage procedure is necessary because integrate_scatter has not been defined ---*/
-  }
-
-
-  // @sect{Class <code>AdvectionOperator</code>}
-
-  // The `AdvectionOperator` class acts as wrapper for
-  // `LocalAdvectionOperator` defining an interface that can be used
-  // with linear solvers like SolverCG. In particular, like every
-  // class that implements the interface of a linear operator, it
-  // needs to have a `vmult()` function that performs the action of
-  // the linear operator on a source vector.
-  //
-  template <int dim, int fe_degree, int n_q_points_1d>
-  class AdvectionOperator {
-  public:
-    AdvectionOperator(const DoFHandler<dim>&           dof_handler,
-                      const AffineConstraints<double>& constraints);
-
-    void initialize_dof_vector(LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>& vec) const;
-
-    void vmult(LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>&       dst,
-               const LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>& src) const;
-
-  private:
-    CUDAWrappers::MatrixFree<dim, double> mf_data; /*--- Notice that this class cannot be derived from MatrixFreeOperators::Base
-                                                         because we need CUDAWrappers::MatrixFree instance ---*/
-  };
-
-
-  // The following is the implementation of the constructor of this
-  // class. In the first part, We initialize the `mf_data` member
-  // variable that is going to provide us with the necessary
-  // information when evaluating the operator.
-  //
-  template <int dim, int fe_degree, int n_q_points_1d>
-  AdvectionOperator<dim, fe_degree, n_q_points_1d>::
-  AdvectionOperator(const DoFHandler<dim>&           dof_handler,
-                    const AffineConstraints<double>& constraints) {
-    typename CUDAWrappers::MatrixFree<dim, double>::AdditionalData additional_data; /*--- Additional data with flags to be initialized ---*/
-    additional_data.mapping_update_flags = update_values | update_JxW_values | update_quadrature_points;
-
-    const QGauss<1> quad(n_q_points_1d); /*--- Quadrature formula ---*/
-
-    mf_data.reinit(MappingQ1<dim>(), dof_handler, constraints, quad, additional_data); /*--- Reinit the matrix free structure ---*/
-  }
-
-
-  // Auxiliary function to initialize vectors since we cannot derive from MatrixFreeOperators and, therefore,
-  // we cannot use a MatrixFree to directly initialize the AdvectionOperator and the corresponding vectors.
-  //
-  template <int dim, int fe_degree, int n_q_points_1d>
-  void AdvectionOperator<dim, fe_degree, n_q_points_1d>::
-  initialize_dof_vector(LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>& vec) const {
-    mf_data.initialize_dof_vector(vec);
-  }
-
-
-  // The key step then is to use all of the previous classes to loop over
-  // all cells to perform the matrix-vector product. We implement this
-  // in the next function.
-  //
-  // When applying the LocalAdvectionOperator, we have to be careful to handle
-  // boundary conditions correctly. Since the local operator doesn't know about
-  // constraints, we have to copy the correct values from the source to the
-  // destination vector afterwards.
-  //
-  template <int dim, int fe_degree, int n_q_points_1d>
-  void AdvectionOperator<dim, fe_degree, n_q_points_1d>::
-  vmult(LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>&       dst,
-        const LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>& src) const {
-    dst = 0;
-
-    LocalAdvectionOperator<dim, fe_degree, n_q_points_1d> local_advection_operator;
-    mf_data.cell_loop(local_advection_operator, src, dst);
-    /*--- The cell_loop needs as first input argument a Functor with a __device__ void operator().
-          Hence, we need a class for the local action and a simple routine seems not to be sufficient because of the operator() request. ---*/
-
-    mf_data.copy_constrained_values(src, dst);
-  }
-
-
   // @sect{Class <code>AdvectionProblem</code>}
 
-  // This is the main class of this program. It defines the usual
-  // framework we use for tutorial programs. The only point worth
-  // commenting on is the `solve()` function and the choice of vector
-  // types.
-  //
   template <int dim, int fe_degree>
   class AdvectionProblem {
   public:
@@ -214,7 +53,7 @@ namespace AdvectionSolver {
 
     Triangulation<dim> triangulation; /*--- The variable which stores the mesh ---*/
 
-    FE_Q<dim>       fe;   /*--- Finite element space ---*/
+    FE_Q<dim>       fe; /*--- Finite element space ---*/
 
     DoFHandler<dim> dof_handler; /*--- Degrees of freedom handler ---*/
 
@@ -231,8 +70,11 @@ namespace AdvectionSolver {
     //
     // In addition, we also keep a solution vector with CPU storage such that we
     // can view and display the solution as usual.
-    LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA> solution_dev;
-    LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA> system_rhs_dev;
+    CUDAWrappers::SparseMatrix<double> system_matrix_dev;
+    SparsityPattern sparsity_pattern;
+
+    LinearAlgebra::CUDAWrappers::Vector<double> solution_dev;
+    LinearAlgebra::CUDAWrappers::Vector<double> system_rhs_dev;
 
     LinearAlgebra::distributed::Vector<double, MemorySpace::Host> solution_host;
     LinearAlgebra::distributed::Vector<double, MemorySpace::Host> solution_host_old;
@@ -241,8 +83,6 @@ namespace AdvectionSolver {
   private:
     EquationData::Density<dim>  rho_init;
     EquationData::Velocity<dim> velocity;
-
-    std::unique_ptr<AdvectionOperator<dim, fe_degree, fe_degree + 1>> system_matrix_dev;
 
     DeclException2(ExcInvalidTimeStep,
                    double,
@@ -256,6 +96,8 @@ namespace AdvectionSolver {
     void setup_system();
 
     void initialize();
+
+    void assemble_matrix();
 
     void assemble_rhs();
 
@@ -281,12 +123,13 @@ namespace AdvectionSolver {
 
     std::ofstream output_n_dofs_density,
                   output_error_rho;
+
+    /*--- CUDA related variable ---*/
+    Utilities::CUDA::Handle cuda_handle;
   };
 
 
-  // The implementation of all the remaining functions of this class apart from
-  // `Advectionproblem::solve()` doesn't contain anything new and we won't
-  // further comment much on the overall approach.
+  // Class constructor
   //
   template <int dim, int fe_degree>
   AdvectionProblem<dim, fe_degree>::AdvectionProblem(RunTimeParameters::Data_Storage& data) :
@@ -327,7 +170,7 @@ namespace AdvectionSolver {
   }
 
 
-  // Setup the system
+  // Setup of the system
   //
   template <int dim, int fe_degree>
   void AdvectionProblem<dim, fe_degree>::setup_system() {
@@ -343,18 +186,20 @@ namespace AdvectionSolver {
                                              constraints);
     constraints.close();
 
+    DynamicSparsityPattern dsp(dof_handler.n_dofs());
+    DoFTools::make_sparsity_pattern(dof_handler, dsp, constraints);
+    sparsity_pattern.copy_from(dsp);
+
+    solution_dev.reinit(dof_handler.n_dofs());
+    system_rhs_dev.reinit(dof_handler.n_dofs());
+
     solution_host.reinit(dof_handler.n_dofs());
     solution_host_old.reinit(dof_handler.n_dofs());
     solution_host_tmp.reinit(dof_handler.n_dofs());
-
-    system_matrix_dev.reset(new AdvectionOperator<dim, fe_degree, fe_degree + 1>(dof_handler, constraints));
-    system_matrix_dev->initialize_dof_vector(solution_dev);
-    system_matrix_dev->initialize_dof_vector(system_rhs_dev);
   }
 
 
   // Initialize the field
-  //
   template <int dim, int fe_degree>
   void AdvectionProblem<dim, fe_degree>::initialize() {
     TimerOutput::Scope t(time_table, "Initialize state");
@@ -367,22 +212,59 @@ namespace AdvectionSolver {
   }
 
 
-  // Unlike programs such as step-4 or step-6, we will not have to
-  // assemble the whole linear system but only the right hand side
-  // vector.
+  // We assemble now the matrix
   //
-  // At the end of the function, we can't directly copy the values
-  // from the host to the device but need to use an intermediate
-  // object of type LinearAlgebra::ReadWriteVector to construct the
-  // correct communication pattern necessary.
+  template <int dim, int fe_degree>
+  void AdvectionProblem<dim, fe_degree>::assemble_matrix() {
+    SparseMatrix<double> system_matrix_host;
+    system_matrix_host.reinit(sparsity_pattern);
+
+    const QGauss<dim> quadrature_formula(fe_degree + 1);
+
+    FEValues<dim> fe_values(fe, quadrature_formula,
+                            update_values | update_gradients | update_quadrature_points | update_JxW_values);
+
+    const unsigned int dofs_per_cell = fe.n_dofs_per_cell();
+    const unsigned int n_q_points    = quadrature_formula.size();
+
+    FullMatrix<double> cell_matrix(dofs_per_cell, dofs_per_cell);
+
+    std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
+
+    for(const auto& cell : dof_handler.active_cell_iterators()) {
+      cell_matrix = 0;
+
+      fe_values.reinit(cell);
+
+      for(unsigned int q_index = 0; q_index < n_q_points; ++q_index) {
+        for(unsigned int i = 0; i < dofs_per_cell; ++i) {
+          for(unsigned int j = 0; j < dofs_per_cell; ++j) {
+            cell_matrix(i,j) += fe_values.shape_value(i, q_index)*
+                                (fe_values.shape_value(j, q_index))*
+                                fe_values.JxW(q_index);
+          }
+        }
+      }
+
+      cell->get_dof_indices(local_dof_indices);
+
+      constraints.distribute_local_to_global(cell_matrix,
+                                             local_dof_indices,
+                                             system_matrix_host);
+    }
+    system_matrix_host.compress(VectorOperation::add);
+
+    system_matrix_dev.reinit(cuda_handle, system_matrix_host);
+  }
+
+
+  // We assemble now the rhs
   //
   template <int dim, int fe_degree>
   void AdvectionProblem<dim, fe_degree>::assemble_rhs() {
-    TimerOutput::Scope t(time_table, "Assemble rhs");
-
     LinearAlgebra::distributed::Vector<double, MemorySpace::Host> system_rhs_host(dof_handler.n_dofs()); /*--- Right hand-side vector ---*/
 
-    const QGauss<dim> quadrature_formula(fe_degree + 1); /*--- Quadrature formula ---*/
+    const QGauss<dim> quadrature_formula(fe_degree + 1);
 
     FEValues<dim> fe_values(fe, quadrature_formula,
                             update_values | update_gradients | update_quadrature_points | update_JxW_values);
@@ -431,15 +313,7 @@ namespace AdvectionSolver {
   }
 
 
-  // This solve() function finally contains the calls to the new classes
-  // previously discussed. Here we don't use any preconditioner, i.e.,
-  // precondition by the identity matrix, to focus just on the peculiarities of
-  // the CUDAWrappers::MatrixFree framework.
-  //
-  // After solving the linear system in the first part of the function, we
-  // copy the solution from the device to the host to be able to view its
-  // values and display it in `output_results()`. This transfer works the same
-  // as at the end of the previous function.
+  // Solve the system
   //
   template <int dim, int fe_degree>
   void AdvectionProblem<dim, fe_degree>::solve() {
@@ -448,8 +322,8 @@ namespace AdvectionSolver {
     PreconditionIdentity preconditioner;
 
     SolverControl solver_control(max_its, eps*system_rhs_dev.l2_norm());
-    SolverCG<LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>> cg(solver_control);
-    cg.solve(*system_matrix_dev, solution_dev, system_rhs_dev, preconditioner);
+    SolverCG<LinearAlgebra::CUDAWrappers::Vector<double>> cg(solver_control);
+    cg.solve(system_matrix_dev, solution_dev, system_rhs_dev, preconditioner);
 
     LinearAlgebra::ReadWriteVector<double> rw_vector(dof_handler.n_dofs());
     rw_vector.import(solution_dev, VectorOperation::insert);
@@ -458,9 +332,9 @@ namespace AdvectionSolver {
     constraints.distribute(solution_host);
   }
 
+
   // The output results function is as usual since we have already copied the
   // values back from the GPU to the CPU.
-  //
   //
   template <int dim, int fe_degree>
   void AdvectionProblem<dim, fe_degree>::output_results(const unsigned int step) {
@@ -493,7 +367,7 @@ namespace AdvectionSolver {
   void AdvectionProblem<dim, fe_degree>::analyze_results() {
     TimerOutput::Scope t(time_table, "Analysis results: computing errrors");
 
-    QGauss<dim> quadrature_formula(EquationData::degree + 1);
+    QGauss<dim> quadrature_formula(fe_degree + 1);
 
     Vector<double> L2_error_per_cell_rho;
     L2_error_per_cell_rho.reinit(triangulation.n_active_cells());
@@ -518,7 +392,7 @@ namespace AdvectionSolver {
 
 
   // There is nothing surprising in the `run()` function either. We simply
-  // call all the previous implemented functions.
+  // compute the solution on a series of (globally) refined meshes.
   //
   template <int dim, int fe_degree>
   void AdvectionProblem<dim, fe_degree>::run(const bool verbose, const unsigned int output_interval) {
@@ -529,6 +403,8 @@ namespace AdvectionSolver {
 
     double time    = t_0;
     unsigned int n = 0;
+
+    assemble_matrix();
 
     while(std::abs(T - time) > 1e-10) {
       time += dt;
@@ -565,28 +441,14 @@ namespace AdvectionSolver {
       output_results(n);
     }
   }
-
-} // namespace AdvectionProblem
+} // namespace AdvectionSolver
 
 
 // @sect3{The <code>main()</code> function}
 
 // Finally for the `main()` function.  By default, all the MPI ranks
 // will try to access the device with number 0, which we assume to be
-// the GPU device associated with the CPU on which a particular MPI
-// rank runs. This works, but if we are running with MPI support it
-// may be that multiple MPI processes are running on the same machine
-// (for example, one per CPU core) and then they would all want to
-// access the same GPU on that machine. If there is only one GPU in
-// the machine, there is nothing we can do about it: All MPI ranks on
-// that machine need to share it. But if there are more than one GPU,
-// then it is better to address different graphic cards for different
-// processes. The choice below is based on the MPI process id by
-// assigning GPUs round robin to GPU ranks. (To work correctly, this
-// scheme assumes that the MPI ranks on one machine are
-// consecutive. If that were not the case, then the rank-GPU
-// association may just not be optimal.) To make this work, MPI needs
-// to be initialized before using this function.
+// the GPU device associated with the CPU.
 //
 int main() {
   try
@@ -599,7 +461,7 @@ int main() {
     RunTimeParameters::Data_Storage data;
     data.read_data("parameter-file.prm");
 
-    deallog.depth_console(data.verbose == true ? 2 : 0);
+    deallog.depth_console(data.verbose == true? 2 : 0);
 
     AdvectionProblem<2, EquationData::degree> advection_problem(data);
     advection_problem.run(data.verbose, data.output_interval);
