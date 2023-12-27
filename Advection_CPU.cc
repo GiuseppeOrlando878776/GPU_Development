@@ -53,9 +53,9 @@ public:
   /*--- The run function which actually runs the simulation ---*/
 
 protected:
-  const double t0;        /*--- Initial time auxiliary variable ----*/
-  const double T;         /*--- Final time auxiliary variable ----*/
-  double       dt;        /*--- Time step auxiliary variable ---*/
+  const double t0; /*--- Initial time auxiliary variable ----*/
+  const double T;  /*--- Final time auxiliary variable ----*/
+  double       dt; /*--- Time step auxiliary variable ---*/
 
   parallel::distributed::Triangulation<dim> triangulation; /*--- The variable which stores the mesh ---*/
 
@@ -217,7 +217,7 @@ void AdvectionSolver<dim>::setup_dofs() {
 
 // @sect{ <code>AdvectionSolver::initialize</code> }
 
-// This method loads the initial data
+// This method loads the initial data.
 //
 template<int dim>
 void AdvectionSolver<dim>::initialize() {
@@ -229,7 +229,7 @@ void AdvectionSolver<dim>::initialize() {
 
 // @sect{<code>AdvectionSolver::update_solution</code>}
 
-// This implements the update of the solution
+// This implements the update of the solution.
 //
 template<int dim>
 void AdvectionSolver<dim>::update_solution() {
@@ -249,14 +249,7 @@ void AdvectionSolver<dim>::update_solution() {
 
 // @sect{ <code>AdvectionSolver::output_results</code> }
 
-// This method plots the current solution. The main difficulty is that we want
-// to create a single output file that contains the data for all velocity
-// components and the pressure. On the other hand, velocities and the pressure
-// live on separate DoFHandler objects, and
-// so can't be written to the same file using a single DataOut object. As a
-// consequence, we have to work a bit harder to get the various pieces of data
-// into a single DoFHandler object, and then use that to drive graphical
-// output.
+// This method plots the current solution.
 //
 template<int dim>
 void AdvectionSolver<dim>::output_results(const unsigned int step) {
@@ -281,7 +274,7 @@ void AdvectionSolver<dim>::output_results(const unsigned int step) {
 // the correctness of our implementation by computing the errors of the
 // numerical result against the analytic solution.
 //
-template <int dim>
+template<int dim>
 void AdvectionSolver<dim>::analyze_results() {
   TimerOutput::Scope t(time_table, "Analysis results: computing errrors");
 
@@ -384,8 +377,6 @@ void AdvectionSolver<dim>::run(const bool verbose, const unsigned int output_int
 //
 int main(int argc, char* argv[]) {
   try {
-    using namespace Advection;
-
     RunTimeParameters::Data_Storage data;
     data.read_data("parameter-file.prm");
 

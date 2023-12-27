@@ -17,7 +17,7 @@
 namespace EquationData {
   using namespace dealii;
 
-  static const unsigned int degree = 2;   /*--- Polynomial degree ---*/
+  static const unsigned int degree = 2; /*--- Polynomial degree ---*/
 
   // We declare now the class that describes the velocity.
   //
