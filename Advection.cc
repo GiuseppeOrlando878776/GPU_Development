@@ -362,6 +362,7 @@ namespace AdvectionSolver {
     DoFTools::extract_locally_relevant_dofs(dof_handler, locally_relevant_dofs);
 
     constraints.clear();
+    constraints.reinit(locally_relevant_dofs);
     DoFTools::make_hanging_node_constraints(dof_handler, constraints);
     VectorTools::interpolate_boundary_values(dof_handler,
                                              0,
@@ -536,7 +537,7 @@ namespace AdvectionSolver {
 
     solution_host_tmp = 0;
     solution_host_tmp.update_ghost_values();
-    VectorTools::integrate_difference(dof_handler, solution_host_tmp, solution_init,
+    VectorTools::integrate_difference(mapping, dof_handler, solution_host_tmp, solution_init,
                                       L2_error_per_cell, quadrature_formula, VectorTools::L2_norm);
     const double L2_rho = VectorTools::compute_global_error(triangulation, L2_error_per_cell, VectorTools::L2_norm);
     const double error_rel_L2 = error_L2/L2_rho;

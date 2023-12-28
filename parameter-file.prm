@@ -23,7 +23,7 @@ subsection Data solve
   set eps            = 1e-6  # stopping criterion
 end
 
-set saving directory = Advection_768_CORES_CPU_DEAL_II_9_4
+set saving directory = Advection_768_CORES_GPU_DEAL_II_9_4
 
 #The output frequency
 set output_interval = 2560

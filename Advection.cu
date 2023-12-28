@@ -182,7 +182,7 @@ namespace AdvectionSolver {
   // constraints, we have to copy the correct values from the source to the
   // destination vector afterwards.
   //
-  template <int dim, int fe_degree, int n_q_points_1d>
+  template<int dim, int fe_degree, int n_q_points_1d>
   void AdvectionOperator<dim, fe_degree, n_q_points_1d>::
   vmult(LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>&       dst,
         const LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>& src) const {
@@ -397,7 +397,7 @@ namespace AdvectionSolver {
   // object of type LinearAlgebra::ReadWriteVector to construct the
   // correct communication pattern necessary.
   //
-  template <int dim, int fe_degree>
+  template<int dim, int fe_degree>
   void AdvectionProblem<dim, fe_degree>::assemble_rhs() {
     TimerOutput::Scope t(time_table, "Assemble rhs");
 
@@ -468,7 +468,7 @@ namespace AdvectionSolver {
   // values and display it in `output_results()`. This transfer works the same
   // as at the end of the previous function.
   //
-  template <int dim, int fe_degree>
+  template<int dim, int fe_degree>
   void AdvectionProblem<dim, fe_degree>::solve() {
     TimerOutput::Scope t(time_table, "Update solution");
 
@@ -489,7 +489,7 @@ namespace AdvectionSolver {
   // values back from the GPU to the CPU.
   //
   //
-  template <int dim, int fe_degree>
+  template<int dim, int fe_degree>
   void AdvectionProblem<dim, fe_degree>::output_results(const unsigned int step) {
     TimerOutput::Scope t(time_table, "Output results");
 
@@ -514,7 +514,7 @@ namespace AdvectionSolver {
   // the correctness of our implementation by computing the errors of the
   // numerical result against the analytic solution.
   //
-  template <int dim, int fe_degree>
+  template<int dim, int fe_degree>
   void AdvectionProblem<dim, fe_degree>::analyze_results() {
     TimerOutput::Scope t(time_table, "Analysis results: computing errrors");
 
@@ -550,7 +550,7 @@ namespace AdvectionSolver {
   // There is nothing surprising in the `run()` function either. We simply
   // call all the previous implemented functions.
   //
-  template <int dim, int fe_degree>
+  template<int dim, int fe_degree>
   void AdvectionProblem<dim, fe_degree>::run(const bool verbose, const unsigned int output_interval) {
     ConditionalOStream verbose_cout(std::cout, verbose && Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0);
 
