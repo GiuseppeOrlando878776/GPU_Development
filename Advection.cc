@@ -318,7 +318,7 @@ namespace AdvectionSolver {
     eps(data.eps),
     saving_dir(data.dir),
     pcout(std::cout, Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0),
-    time_out("./" + data.dir + "/time_analysis_" +
+    time_out("/scratch/snx3000/gorlando/GPU_Development/" + data.dir + "/time_analysis_" +
              Utilities::int_to_string(Utilities::MPI::n_mpi_processes(MPI_COMM_WORLD)) + "proc.dat"),
     ptime_out(time_out, Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0),
     time_table(ptime_out, TimerOutput::summary, TimerOutput::cpu_and_wall_times),
@@ -509,7 +509,7 @@ namespace AdvectionSolver {
     DataOutBase::VtkFlags flags;
     flags.compression_level = DataOutBase::VtkFlags::best_speed;
     data_out.set_flags(flags);
-    std::string output_file = "./" + saving_dir + "/solution_" + Utilities::int_to_string(step, 5) + ".vtu";
+    std::string output_file = "/scratch/snx3000/gorlando/GPU_Development/" + saving_dir + "/solution_" + Utilities::int_to_string(step, 5) + ".vtu";
     data_out.write_vtu_in_parallel(output_file, MPI_COMM_WORLD);
 
     solution_host.zero_out_ghost_values();
