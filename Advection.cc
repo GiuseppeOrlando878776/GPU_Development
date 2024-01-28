@@ -139,10 +139,10 @@ namespace AdvectionSolver {
                       const DoFHandler<dim>&           dof_handler,
                       const AffineConstraints<double>& constraints);
 
-    void initialize_dof_vector(LinearAlgebra::distributed::Vector<double, MemorySpace::Default>& vec) const;
+    void initialize_dof_vector(LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>& vec) const;
 
-    void vmult(LinearAlgebra::distributed::Vector<double, MemorySpace::Default>&       dst,
-               const LinearAlgebra::distributed::Vector<double, MemorySpace::Default>& src) const;
+    void vmult(LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>&       dst,
+               const LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>& src) const;
 
   private:
     CUDAWrappers::MatrixFree<dim, double> mf_data; /*--- Notice that this class cannot be derived from MatrixFreeOperators::Base
@@ -174,7 +174,7 @@ namespace AdvectionSolver {
   //
   template<int dim, int fe_degree, int n_q_points_1d>
   void AdvectionOperator<dim, fe_degree, n_q_points_1d>::
-  initialize_dof_vector(LinearAlgebra::distributed::Vector<double, MemorySpace::Default>& vec) const {
+  initialize_dof_vector(LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>& vec) const {
     mf_data.initialize_dof_vector(vec);
   }
 
@@ -190,8 +190,8 @@ namespace AdvectionSolver {
   //
   template<int dim, int fe_degree, int n_q_points_1d>
   void AdvectionOperator<dim, fe_degree, n_q_points_1d>::
-  vmult(LinearAlgebra::distributed::Vector<double, MemorySpace::Default>&       dst,
-        const LinearAlgebra::distributed::Vector<double, MemorySpace::Default>& src) const {
+  vmult(LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>&       dst,
+        const LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>& src) const {
     dst = 0;
 
     LocalAdvectionOperator<dim, fe_degree, n_q_points_1d> local_advection_operator;
@@ -243,8 +243,8 @@ namespace AdvectionSolver {
     //
     // In addition, we also keep a solution vector with CPU storage such that we
     // can view and display the solution as usual.
-    LinearAlgebra::distributed::Vector<double, MemorySpace::Default> solution_dev;
-    LinearAlgebra::distributed::Vector<double, MemorySpace::Default> system_rhs_dev;
+    LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA> solution_dev;
+    LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA> system_rhs_dev;
 
     LinearAlgebra::distributed::Vector<double, MemorySpace::Host> solution_host;
     LinearAlgebra::distributed::Vector<double, MemorySpace::Host> solution_host_old;
@@ -322,8 +322,8 @@ namespace AdvectionSolver {
              Utilities::int_to_string(Utilities::MPI::n_mpi_processes(MPI_COMM_WORLD)) + "proc.dat"),
     ptime_out(time_out, Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0),
     time_table(ptime_out, TimerOutput::summary, TimerOutput::cpu_and_wall_times),
-    output_n_dofs("./" + data.dir + "/n_dofs.dat", std::ofstream::out),
-    output_error("./" + data.dir + "/error_analysis.dat", std::ofstream::out) {
+    output_n_dofs("/scratch/snx3000/gorlando/GPU_Development/" + data.dir + "/n_dofs.dat", std::ofstream::out),
+    output_error("/scratch/snx3000/gorlando/GPU_Development/" + data.dir + "/error_analysis.dat", std::ofstream::out) {
       AssertThrow(!((dt <= 0.0) || (dt > 0.5*T)), ExcInvalidTimeStep(dt, 0.5*T));
 
       create_triangulation(data.n_global_refines);
@@ -481,7 +481,7 @@ namespace AdvectionSolver {
     PreconditionIdentity preconditioner;
 
     SolverControl solver_control(max_its, eps*system_rhs_dev.l2_norm());
-    SolverCG<LinearAlgebra::distributed::Vector<double, MemorySpace::Default>> cg(solver_control);
+    SolverCG<LinearAlgebra::distributed::Vector<double, MemorySpace::CUDA>> cg(solver_control);
     cg.solve(*system_matrix_dev, solution_dev, system_rhs_dev, preconditioner);
 
     LinearAlgebra::ReadWriteVector<double> rw_vector(locally_owned_dofs);
